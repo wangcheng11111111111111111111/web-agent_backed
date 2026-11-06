@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables (contains secrets)
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# AI model weights (too large for git)
+models/
+vendor/RVC/assets/
+
+# Runtime upload data
+data/
+logs/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local backups of vendored repository metadata
+.vendor-meta-backup/
+
+# OS
+.DS_Store
+Thumbs.db

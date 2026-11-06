@@ -1,0 +1,18 @@
+-r requirements.txt
+
+# Optional local CosyVoice2 runtime. Keep diffusers on the version expected by
+# the vendored Matcha-TTS dependency so huggingface-hub stays compatible.
+conformer==0.3.2
+diffusers==0.29.0
+gdown>=5.2.0,<6.0.0
+HyperPyYAML>=1.2.0,<2.0.0
+imageio-ffmpeg>=0.6.0,<1.0.0
+inflect>=7.0.0,<8.0.0
+matplotlib>=3.9.0,<4.0.0
+modelscope>=1.20.0,<2.0.0
+onnxruntime>=1.18.0,<2.0.0
+openai-whisper>=20231117
+pyworld>=0.3.4,<1.0.0
+transformers==4.51.3
+wetext>=0.2.0,<1.0.0
+x-transformers>=2.11.0,<3.0.0

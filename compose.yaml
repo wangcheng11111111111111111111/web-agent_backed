@@ -1,0 +1,163 @@
+name: nebula-ai
+
+x-backend-common: &backend-common
+  image: nebula-backend:local
+  build:
+    context: .
+
+x-backend-environment: &backend-environment
+  APP_ENV: production
+  API_HOST: 0.0.0.0
+  API_PORT: 8000
+  CORS_ORIGINS: http://localhost:${WEB_PORT:-8080},http://127.0.0.1:${WEB_PORT:-8080}
+  PG_HOST: postgres
+  PG_PORT: 5432
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_PASSWORD: ""
+  QDRANT_HOST: qdrant
+  QDRANT_PORT: 6333
+  QDRANT_API_KEY: ""
+  LOCAL_TTS_MODEL_DIR: /app/models/cosyvoice2
+  LOCAL_TTS_DEVICE: cuda
+  LOCAL_RVC_MODEL_DIR: /app/models/rvc/weights
+  LOCAL_RVC_INDEX_DIR: /app/models/rvc/indexes
+  LOCAL_RVC_DEVICE: cuda
+  HF_HOME: /app/data/huggingface
+  TORCH_HOME: /app/data/torch
+  PYTHONUNBUFFERED: "1"
+  TZ: Asia/Shanghai
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${PG_DATABASE:-agent_db}
+      POSTGRES_USER: ${PG_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?Set PG_PASSWORD in .env and start with scripts/docker-up.ps1}
+      TZ: Asia/Shanghai
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${PG_USERNAME:-postgres} -d ${PG_DATABASE:-agent_db}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c ':> /dev/tcp/127.0.0.1/6333'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  init:
+    <<: *backend-common
+    env_file:
+      - ./.env
+    environment:
+      <<: *backend-environment
+    command:
+      [
+        "sh",
+        "-c",
+        "python scripts/migrate.py && python scripts/init_qdrant.py",
+      ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    <<: *backend-common
+    env_file:
+      - ./.env
+    environment:
+      <<: *backend-environment
+    volumes:
+      - ./models:/app/models
+      - ./vendor/RVC/assets:/app/vendor/RVC/assets:ro
+      - ./data:/app/data
+    expose:
+      - "8000"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)",
+        ]
+      interval: 15s
+      timeout: 10s
+      start_period: 60s
+      retries: 10
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  frontend:
+    image: nebula-frontend:local
+    build:
+      context: ${FRONTEND_CONTEXT:-../frontend}
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/healthz >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:

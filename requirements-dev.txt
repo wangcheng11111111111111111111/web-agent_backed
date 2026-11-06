@@ -1,0 +1,2 @@
+# Local development uses the same runtime set as the Docker image.
+-r requirements-docker.txt
