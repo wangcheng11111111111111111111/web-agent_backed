@@ -20,7 +20,9 @@ _DEFAULT_HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Accept-Encoding": "text/html",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "no-cache",
 }
 
 _TITLE_PATTERN = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
@@ -41,6 +43,12 @@ class WebCrawlerService:
     async def fetch(self, url: str) -> dict[str, Any] | None:
         if not self.settings.web_crawl_enabled:
             return None
+        direct = await self._fetch_direct(url)
+        if direct is not None:
+            return direct
+        return await self._fetch_reader(url)
+
+    async def _fetch_direct(self, url: str) -> dict[str, Any] | None:
         timeout = httpx.Timeout(
             self.settings.web_crawl_timeout, connect=min(10.0, self.settings.web_crawl_timeout)
         )
@@ -71,6 +79,53 @@ class WebCrawlerService:
             "url": url,
             "title": title[:200],
             "content": body[: self.settings.web_crawl_max_chars],
+        }
+
+    async def _fetch_reader(self, url: str) -> dict[str, Any] | None:
+        reader_url = f"https://r.jina.ai/{url}"
+        timeout = httpx.Timeout(
+            self.settings.web_crawl_timeout,
+            connect=min(10.0, self.settings.web_crawl_timeout),
+        )
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=True,
+            ) as client:
+                response = await client.get(
+                    reader_url,
+                    headers={
+                        "Accept": "text/plain,text/markdown;q=0.9,*/*;q=0.5",
+                        "User-Agent": _DEFAULT_HEADERS["User-Agent"],
+                    },
+                )
+                response.raise_for_status()
+                content = response.text.strip()
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "Crawl reader fallback failed: %s url=%s",
+                type(exc).__name__,
+                url,
+            )
+            return None
+        if not content:
+            logger.info("Crawl reader returned no body: %s", url)
+            return None
+        title = ""
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                title = stripped.lstrip("#").strip()
+                break
+        logger.info(
+            "Crawl reader fallback succeeded chars=%s url=%s",
+            len(content),
+            url,
+        )
+        return {
+            "url": url,
+            "title": title[:200],
+            "content": content[: self.settings.web_crawl_max_chars],
         }
 
     async def fetch_safe(self, url: str) -> dict[str, Any] | None:

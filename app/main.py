@@ -158,10 +158,12 @@ def _build_container(settings: Settings) -> Container:
     agent = AssistantGraph(
         llm,
         rag,
-        long_term_memory,
-        web_search,
-        conversation_recall,
-        web_crawler,
+        long_term_memory=long_term_memory,
+        web_search=web_search,
+        conversation_recall=conversation_recall,
+        web_crawler=web_crawler,
+        document_repository=document_repository,
+        memory_repository=memory_repository,
     )
     documents = DocumentService(settings, document_repository, rag)
     tts = TTSService(settings)
@@ -758,6 +760,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
         state = request.app.state.container
         client_id, tenant_id, user_id = _identity(request)
+        logger.info(
+            "Chat request session_id=%s enable_web_search=%s",
+            payload.session_id,
+            payload.enable_web_search,
+        )
         start = await state.chat_repository.begin_chat(
             payload.message,
             payload.session_id,
@@ -772,6 +779,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             sources: list[dict[str, Any]] = []
             memories: list[dict[str, Any]] = []
             recalled: list[dict[str, Any]] = []
+            assistant_message_id: UUID | None = None
 
             async def emit(event: dict[str, Any]) -> None:
                 await queue.put(event)
@@ -821,7 +829,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
                     raise ModelUpstreamError("模型返回了空响应，请稍后重试")
                 try:
-                    await state.chat_repository.finish_chat(
+                    assistant_message_id = await state.chat_repository.finish_chat(
                         start.session_id, answer
                     )
                 except Exception:
@@ -843,6 +851,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "type": "done",
                         "status": "ok",
                         "session_id": str(start.session_id),
+                        "assistant_message_id": (
+                            str(assistant_message_id)
+                            if assistant_message_id is not None
+                            else None
+                        ),
                         "sources": sources,
                         "memories": memories,
                         "recalled_conversations": recalled,
@@ -1234,7 +1247,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/audio/tts/stream", tags=["audio"])
     async def text_to_speech_stream(request: Request) -> StreamingResponse:
-        tts: TTSService = request.app.state.container.tts
+        state = request.app.state.container
+        tts: TTSService = state.tts
         if not tts.configured:
             raise HTTPException(
                 status_code=503,
@@ -1250,11 +1264,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=400,
                 detail={"code": "invalid_json", "message": "请求体必须是 JSON"},
             )
-        text = str(payload.get("text", "")).strip()
-        if not text:
+        raw_message_id = str(payload.get("message_id", "")).strip()
+        if not raw_message_id:
             raise HTTPException(
                 status_code=400,
-                detail={"code": "empty_text", "message": "文本不能为空"},
+                detail={
+                    "code": "message_id_required",
+                    "message": "缺少 message_id",
+                },
+            )
+        try:
+            message_id = UUID(raw_message_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_message_id",
+                    "message": "message_id 必须是 UUID",
+                },
+            ) from exc
+        client_id, tenant_id, user_id = _identity(request)
+        text = await state.chat_repository.get_message_content(
+            message_id,
+            client_id=client_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if text is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "message_not_found",
+                    "message": "助手消息不存在或不属于当前用户",
+                },
+            )
+        text = text.strip()
+        if not text:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "empty_message", "message": "助手消息内容为空"},
             )
 
         engine = str(payload.get("engine", "")).strip() or None

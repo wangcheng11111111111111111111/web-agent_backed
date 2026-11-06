@@ -133,6 +133,92 @@ class LLMClient:
             logger.error("LLM request failed: %s", type(exc).__name__)
             raise ModelUpstreamError() from exc
 
+    async def select_tools(
+        self,
+        *,
+        message: str,
+        history: list[dict[str, str]],
+        tools: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Ask the chat model which available tools should handle this turn."""
+        if not self.settings.model_configured or not tools:
+            return []
+        payload = {
+            "model": self.settings.llm_model,
+            "messages": await self._messages(
+                message,
+                history,
+                "",
+                "",
+                "",
+                "",
+            ),
+            "tools": tools,
+            "tool_choice": "auto",
+            "stream": False,
+            "temperature": 0,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.settings.llm_api_key}",
+            "Content-Type": "application/json",
+        }
+        timeout = httpx.Timeout(
+            self.settings.llm_timeout,
+            connect=min(15.0, self.settings.llm_timeout),
+        )
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    f"{self.settings.llm_base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+            if response.status_code >= 400:
+                logger.warning(
+                    "LLM tool selection returned HTTP %s",
+                    response.status_code,
+                )
+                return []
+            data = response.json()
+            response_message = (
+                (data.get("choices") or [{}])[0].get("message") or {}
+            )
+            selected: list[dict[str, object]] = []
+            for index, item in enumerate(response_message.get("tool_calls") or []):
+                function = item.get("function") or {}
+                name = str(function.get("name", "")).strip()
+                if not name:
+                    continue
+                raw_arguments = function.get("arguments") or "{}"
+                try:
+                    arguments = (
+                        json.loads(raw_arguments)
+                        if isinstance(raw_arguments, str)
+                        else raw_arguments
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    arguments = {}
+                selected.append(
+                    {
+                        "id": str(item.get("id") or f"tool_call_{index}"),
+                        "name": name,
+                        "arguments": (
+                            arguments if isinstance(arguments, dict) else {}
+                        ),
+                    }
+                )
+            logger.info(
+                "LLM selected tools=%s",
+                [item["name"] for item in selected],
+            )
+            return selected
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            logger.warning(
+                "LLM tool selection failed safely (%s)",
+                type(exc).__name__,
+            )
+            return []
+
     async def extract_memories(
         self,
         *,

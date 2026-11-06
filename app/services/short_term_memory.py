@@ -83,6 +83,37 @@ class ShortTermMemory:
     def _meta_key(session_id: UUID) -> str:
         return f"session:{session_id}:meta"
 
+    @staticmethod
+    def _message_content_key(message_id: UUID | str) -> str:
+        return f"message:{message_id}:content"
+
+    async def get_message_content(self, message_id: UUID | str) -> str | None:
+        if not await self.connect():
+            return None
+        assert self.client is not None
+        try:
+            return await self.client.get(self._message_content_key(message_id))
+        except Exception as exc:
+            self._mark_failure(exc)
+            return None
+
+    async def cache_message_content(
+        self,
+        message_id: UUID | str,
+        content: str,
+    ) -> None:
+        if not await self.connect():
+            return
+        assert self.client is not None
+        try:
+            await self.client.set(
+                self._message_content_key(message_id),
+                content,
+                ex=self.settings.session_ttl_seconds,
+            )
+        except Exception as exc:
+            self._mark_failure(exc)
+
     async def get_history(
         self, session_id: UUID
     ) -> list[dict[str, Any]] | None:
@@ -134,6 +165,15 @@ class ShortTermMemory:
             if serialized:
                 pipe.rpush(self._messages_key(session_id), *serialized)
                 pipe.expire(self._messages_key(session_id), ttl)
+                for message in messages[-limit:]:
+                    message_id = message.get("id")
+                    content = message.get("content")
+                    if message_id and isinstance(content, str):
+                        pipe.set(
+                            self._message_content_key(str(message_id)),
+                            content,
+                            ex=ttl,
+                        )
             if title is not None:
                 pipe.hset(
                     self._meta_key(session_id),
@@ -164,6 +204,11 @@ class ShortTermMemory:
                 self.settings.short_term_message_limit,
                 self.settings.session_ttl_seconds,
             )
+            if result:
+                await self.cache_message_content(
+                    str(message["id"]),
+                    str(message["content"]),
+                )
             return bool(result)
         except Exception as exc:
             self._mark_failure(exc)
@@ -174,10 +219,18 @@ class ShortTermMemory:
             return
         assert self.client is not None
         try:
-            await self.client.delete(
-                self._messages_key(session_id),
-                self._meta_key(session_id),
-            )
+            messages_key = self._messages_key(session_id)
+            raw_messages = await self.client.lrange(messages_key, 0, -1)
+            pipe = self.client.pipeline(transaction=True)
+            pipe.delete(messages_key, self._meta_key(session_id))
+            for raw in raw_messages:
+                try:
+                    message_id = json.loads(raw).get("id")
+                except (json.JSONDecodeError, AttributeError):
+                    message_id = None
+                if message_id:
+                    pipe.delete(self._message_content_key(str(message_id)))
+            await pipe.execute()
         except Exception as exc:
             self._mark_failure(exc)
 

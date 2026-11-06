@@ -19,7 +19,7 @@ from app.services.voice_prompts import VoicePromptStore
 
 logger = logging.getLogger(__name__)
 
-MAX_TTS_CHARS = 800
+MAX_TTS_CHARS = 20000
 _EDGE_VOICE = "zh-CN-XiaoxiaoNeural"
 
 EDGE_CN_VOICES: dict[str, str] = {
@@ -155,7 +155,7 @@ def _take_tts_chunk(text: str, limit: int) -> tuple[str, str]:
 
 def _split_tts_sentences(
     text: str,
-    max_sentence_chars: int = 72,
+    max_sentence_chars: int = 64,
 ) -> list[str]:
     """Split by complete sentences and split long sentences into at most two."""
     boundaries = list(re.finditer(r"[。！？!?；;]+|\n+", text))
@@ -199,33 +199,42 @@ def _split_tts_sentences(
 
 def _group_sentence_segments(
     segments: list[str],
-    maximum_chars: int = 84,
     first_maximum_chars: int = 120,
-    step_chars: int = 12,
-    minimum_chars: int = 84,
-    group_offset: int = 0,
+    subsequent_start_chars: int = 80,
+    previous_chars: int | None = None,
 ) -> list[str]:
-    """Pack longer initial blocks, then shrink blocks to keep synthesis ahead."""
+    """Build strictly decreasing blocks while preferring sentence boundaries."""
     grouped: list[str] = []
-    current = ""
-    for segment in segments:
-        if not current:
-            current = segment
-            continue
-        group_index = group_offset + len(grouped)
+    pending = [segment.strip() for segment in segments if segment.strip()]
+    previous = previous_chars
+    while pending:
         limit = (
-            max(minimum_chars, first_maximum_chars - group_index * step_chars)
-            if first_maximum_chars > maximum_chars
-            else maximum_chars
+            first_maximum_chars
+            if previous is None
+            else min(subsequent_start_chars, max(1, previous - 1))
         )
-        can_merge = len(current) + len(segment) <= limit
-        if can_merge:
-            current += segment
-        else:
-            grouped.append(current)
-            current = segment
-    if current:
-        grouped.append(current)
+        content = ""
+        while pending:
+            remaining = limit - len(content)
+            if remaining <= 0:
+                break
+            segment = pending.pop(0)
+            if len(segment) <= remaining:
+                content += segment
+                continue
+            take, left = _take_tts_chunk(segment, remaining)
+            content += take
+            if left:
+                pending.insert(0, left)
+            break
+        content = content.strip()
+        if not content:
+            segment = pending.pop(0)
+            content, left = _take_tts_chunk(segment, max(1, limit))
+            if left:
+                pending.insert(0, left)
+        grouped.append(content)
+        previous = len(content)
     return grouped
 
 
@@ -241,16 +250,8 @@ def _group_tts_paragraphs(text: str) -> list[str]:
         sentences = _split_tts_sentences(paragraph)
         paragraph_groups = _group_sentence_segments(
             sentences,
-            group_offset=len(grouped),
+            previous_chars=len(grouped[-1]) if grouped else None,
         )
-        if (
-            len(paragraph_groups) >= 2
-            and len(paragraph_groups[-1]) < 48
-            and len(paragraph_groups[-2]) + len(paragraph_groups[-1]) <= 120
-        ):
-            paragraph_groups[-2:] = [
-                paragraph_groups[-2] + paragraph_groups[-1]
-            ]
         grouped.extend(paragraph_groups)
     return grouped or [text.strip()]
 

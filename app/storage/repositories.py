@@ -313,6 +313,44 @@ class ChatRepository:
             )
         return result
 
+    async def get_message_content(
+        self,
+        message_id: UUID,
+        *,
+        client_id: str,
+        tenant_id: str,
+        user_id: str,
+        role: str = "assistant",
+    ) -> str | None:
+        if self.short_term_memory is not None and role == "assistant":
+            cached = await self.short_term_memory.get_message_content(message_id)
+            if cached is not None:
+                return cached
+        async with self.database.acquire() as connection:
+            content = await connection.fetchval(
+                """
+                SELECT m.content
+                FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE m.id = $1
+                  AND m.role = $2
+                  AND s.client_id = $3
+                  AND s.tenant_id = $4
+                  AND s.user_id = $5
+                """,
+                message_id,
+                role,
+                client_id,
+                tenant_id,
+                user_id,
+            )
+        if content is None:
+            return None
+        text = str(content)
+        if self.short_term_memory is not None and role == "assistant":
+            await self.short_term_memory.cache_message_content(message_id, text)
+        return text
+
     async def delete_session(
         self,
         session_id: UUID,

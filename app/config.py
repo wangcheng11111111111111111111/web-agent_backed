@@ -223,13 +223,6 @@ class Settings:
     web_search_enabled: bool = field(
         default_factory=lambda: _bool("WEB_SEARCH_ENABLED")
     )
-    web_search_provider: str = field(
-        default_factory=lambda: _str("WEB_SEARCH_PROVIDER").lower()
-    )
-    web_search_api_key: str = field(
-        default_factory=lambda: _allow_empty("WEB_SEARCH_API_KEY"),
-        repr=False,
-    )
     web_search_top_k: int = field(
         default_factory=lambda: _int("WEB_SEARCH_TOP_K")
     )
