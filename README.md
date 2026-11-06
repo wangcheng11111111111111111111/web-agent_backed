@@ -80,10 +80,10 @@ FastAPI
 
 模型工具调用使用 OpenAI 兼容 `tools/tool_calls`。可用工具包括当前时间、
 安全算术计算、本地知识库检索、知识库文档列表、长期记忆列表、历史会话
-检索、网页抓取和 Bing 搜索。模型为 `web_search` 生成包含对象、年份和
-日期的查询词；后端在“今天/今日”查询中自动补充当天日期，先解析 Bing
-HTML，无结果时改用 Bing RSS，并抓取前两条搜索结果正文辅助回答。搜索
-不依赖 API Key，也不会自动切换其他搜索引擎。
+检索、网页抓取和联网搜索。可将 `WEB_SEARCH_PROVIDER` 设为 `tavily`
+或 `serper` 并填写 `WEB_SEARCH_API_KEY`；未配置 Key、留空 Provider 或
+API 调用失败时使用 Bing。模型为 `web_search` 生成包含对象、年份和日期
+的查询词；后端自动补充当天日期，解析 Bing HTML/RSS 并抓取搜索结果正文。
 CS2/CSGO 查询会自动识别今天、昨天、明天及显式日期，追加 HLTV 和
 Liquipedia 站内查询，并优先抓取 HLTV 对应日期的结果页。
 如果搜索结果页直连返回 403、反爬挑战或没有正文，后端会通过

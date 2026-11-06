@@ -32,6 +32,19 @@ class WebSearchService:
     async def search(self, query: str) -> list[dict[str, Any]]:
         if not self.settings.web_search_enabled:
             return []
+        api_results = await self._search_api(query)
+        if api_results:
+            logger.info(
+                "Web search provider=%s result_count=%s",
+                self.settings.web_search_provider,
+                len(api_results),
+            )
+            return api_results[: self.settings.web_search_top_k]
+        return await self._search_bing(query)
+
+    async def _search_bing(self, query: str) -> list[dict[str, Any]]:
+        if not self.settings.web_search_enabled:
+            return []
         now = datetime.now(timezone(timedelta(hours=8)))
         query_date = self._resolve_query_date(query, now)
         queries = [query]
@@ -102,6 +115,91 @@ class WebSearchService:
         if not results:
             logger.info("Bing returned no results")
         return results[: self.settings.web_search_top_k]
+
+    async def _search_api(self, query: str) -> list[dict[str, Any]]:
+        provider = self.settings.web_search_provider.strip().lower()
+        api_key = self.settings.web_search_api_key.strip()
+        if not provider or provider == "bing" or not api_key:
+            return []
+        try:
+            if provider == "tavily":
+                return await self._tavily(query, api_key)
+            if provider == "serper":
+                return await self._serper(query, api_key)
+            logger.warning(
+                "Unknown web search provider=%s; falling back to Bing",
+                provider,
+            )
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            logger.warning(
+                "Web search API failed; falling back to Bing (%s)",
+                type(exc).__name__,
+            )
+        return []
+
+    async def _tavily(
+        self,
+        query: str,
+        api_key: str,
+    ) -> list[dict[str, Any]]:
+        timeout = httpx.Timeout(self.settings.web_search_timeout, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": api_key,
+                    "query": query,
+                    "search_depth": "basic",
+                    "max_results": self.settings.web_search_top_k,
+                    "include_answer": False,
+                    "include_raw_content": False,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        return [
+            {
+                "title": str(item.get("title", ""))[:200],
+                "url": str(item.get("url", ""))[:500],
+                "snippet": str(item.get("content", ""))[:500],
+            }
+            for item in payload.get("results", [])[
+                : self.settings.web_search_top_k
+            ]
+            if item.get("url")
+        ]
+
+    async def _serper(
+        self,
+        query: str,
+        api_key: str,
+    ) -> list[dict[str, Any]]:
+        timeout = httpx.Timeout(self.settings.web_search_timeout, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                "https://google.serper.dev/search",
+                headers={
+                    "X-API-KEY": api_key,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "q": query,
+                    "num": self.settings.web_search_top_k,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        return [
+            {
+                "title": str(item.get("title", ""))[:200],
+                "url": str(item.get("link", ""))[:500],
+                "snippet": str(item.get("snippet", ""))[:500],
+            }
+            for item in payload.get("organic", [])[
+                : self.settings.web_search_top_k
+            ]
+            if item.get("link")
+        ]
 
     @staticmethod
     def _resolve_query_date(
