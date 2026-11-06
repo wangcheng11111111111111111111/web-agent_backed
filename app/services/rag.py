@@ -338,7 +338,7 @@ class RagService:
 
     async def search_safe(self, query: str) -> list[dict[str, Any]]:
         if not self.settings.embeddings_configured:
-            logger.info("RAG skipped: embedding key is not configured")
+            logger.info("RAG skipped: embedding config is incomplete")
             return []
         try:
             return await self.search(query)

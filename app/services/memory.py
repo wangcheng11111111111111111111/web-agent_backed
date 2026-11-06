@@ -555,10 +555,10 @@ class LongTermMemory:
         if not self.settings.memory_enabled:
             return 0
         if not self.settings.model_configured:
-            logger.info("Long-term memory extraction skipped: model key missing")
+            logger.info("Long-term memory extraction skipped: model config missing")
             return 0
         if not self.settings.embeddings_configured:
-            logger.info("Long-term memory extraction skipped: embedding key missing")
+            logger.info("Long-term memory extraction skipped: embedding config missing")
             return 0
         try:
             raw_candidates = await self.llm.extract_memories(

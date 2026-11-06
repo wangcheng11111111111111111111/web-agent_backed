@@ -26,7 +26,10 @@ class SessionNotFoundError(AppError):
 class ModelConfigError(AppError):
     code = "model_key_missing"
     status_code = 503
-    public_message = "后端未配置模型密钥，请在 backend/.env 中设置 LLM_API_KEY"
+    public_message = (
+        "后端模型配置不完整，请在 backend/.env 中设置 "
+        "LLM_API_KEY、LLM_BASE_URL 和 LLM_MODEL"
+    )
 
 
 class ModelTimeoutError(AppError):
@@ -44,7 +47,10 @@ class ModelUpstreamError(AppError):
 class EmbeddingConfigError(AppError):
     code = "embedding_key_missing"
     status_code = 503
-    public_message = "后端未配置 Embedding 密钥，无法处理知识库"
+    public_message = (
+        "后端 Embedding 配置不完整，请设置 "
+        "EMBEDDING_API_KEY、EMBEDDING_BASE_URL 和 EMBEDDING_MODEL"
+    )
 
 
 class EmbeddingUpstreamError(AppError):

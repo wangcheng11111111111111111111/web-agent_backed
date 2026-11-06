@@ -354,7 +354,7 @@ class VoicePromptStore:
             )
 
     async def _recognize(self, path: Path, filename: str) -> str:
-        if self.settings.stt_enabled and self.settings.stt_api_key:
+        if self.settings.remote_stt_configured:
             try:
                 return await self._recognize_remote(path, filename)
             except Exception:

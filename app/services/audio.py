@@ -200,15 +200,25 @@ def _split_tts_sentences(
 def _group_sentence_segments(
     segments: list[str],
     maximum_chars: int = 84,
+    first_maximum_chars: int = 120,
+    step_chars: int = 12,
+    minimum_chars: int = 84,
+    group_offset: int = 0,
 ) -> list[str]:
-    """Pack complete sentences into coherent blocks."""
+    """Pack longer initial blocks, then shrink blocks to keep synthesis ahead."""
     grouped: list[str] = []
     current = ""
     for segment in segments:
         if not current:
             current = segment
             continue
-        can_merge = len(current) + len(segment) <= maximum_chars
+        group_index = group_offset + len(grouped)
+        limit = (
+            max(minimum_chars, first_maximum_chars - group_index * step_chars)
+            if first_maximum_chars > maximum_chars
+            else maximum_chars
+        )
+        can_merge = len(current) + len(segment) <= limit
         if can_merge:
             current += segment
         else:
@@ -217,6 +227,32 @@ def _group_sentence_segments(
     if current:
         grouped.append(current)
     return grouped
+
+
+def _group_tts_paragraphs(text: str) -> list[str]:
+    """Group each paragraph separately so tone and emphasis do not cross blocks."""
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n+", text)
+        if paragraph.strip()
+    ]
+    grouped: list[str] = []
+    for paragraph in paragraphs:
+        sentences = _split_tts_sentences(paragraph)
+        paragraph_groups = _group_sentence_segments(
+            sentences,
+            group_offset=len(grouped),
+        )
+        if (
+            len(paragraph_groups) >= 2
+            and len(paragraph_groups[-1]) < 48
+            and len(paragraph_groups[-2]) + len(paragraph_groups[-1]) <= 120
+        ):
+            paragraph_groups[-2:] = [
+                paragraph_groups[-2] + paragraph_groups[-1]
+            ]
+        grouped.extend(paragraph_groups)
+    return grouped or [text.strip()]
 
 
 def _normalize_spoken_text(text: str) -> str:
@@ -247,7 +283,8 @@ def _normalize_spoken_text(text: str) -> str:
     text = text.replace("、", "，")
 
     text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\s*\n\s*", "\n", text)
+    text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[，,]{2,}", "，", text)
     text = re.sub(r"。{2,}", "。", text)
     text = re.sub(r"，([。！？!?；;])", r"\1", text)
@@ -271,6 +308,7 @@ class TTSService:
         self._last_cosyvoice_import_error: str | None = None
         self._prompt_cache_keys: dict[str, tuple[str, int, int, str]] = {}
         self._rvc_engine: _RVCEngine | None = None
+        self._rvc_warmed_key: tuple[str, int, int] | None = None
         self._synthesize_lock = asyncio.Lock()
         self._rvc_disabled = False
         self.prompts = VoicePromptStore(
@@ -528,19 +566,47 @@ class TTSService:
             logger.warning("RVC 未安装，音色转换功能不可用")
             self._rvc_engine = None
 
-    def _warm_rvc(self) -> None:
+    def _preload_rvc_model(self, model_name: str | None = None) -> str:
         import numpy as np
 
         models = _scan_rvc_models(self.rvc_model_dir)
-        if self._rvc_engine is None or not models:
-            return
+        if not models:
+            raise FileNotFoundError("没有可用的 RVC 模型")
+        target = next(
+            (model for model in models if model.stem == model_name),
+            models[0] if not model_name else None,
+        )
+        if target is None:
+            raise FileNotFoundError(f"RVC 模型不存在: {model_name}")
+        if self._rvc_engine is None:
+            self._init_rvc()
+        if self._rvc_engine is None:
+            raise RuntimeError("RVC 引擎未初始化")
+
+        stat = target.stat()
+        warm_key = (target.stem, stat.st_size, stat.st_mtime_ns)
+        if self._rvc_warmed_key == warm_key:
+            return target.stem
         sample_rate = 24000
         points = np.arange(sample_rate, dtype=np.float32)
         sample = (0.1 * np.sin(2 * np.pi * 220 * points / sample_rate)).astype(
             np.float32
         )
-        self._rvc_engine.convert(sample, target_model=models[0].stem)
-        logger.info("RVC runtime preloaded with model %s", models[0].stem)
+        self._rvc_engine.convert(sample, target_model=target.stem)
+        self._rvc_warmed_key = warm_key
+        logger.info("RVC runtime preloaded with model %s", target.stem)
+        return target.stem
+
+    def _warm_rvc(self) -> None:
+        if self._rvc_engine is None or not self.rvc_enabled:
+            return
+        self._preload_rvc_model()
+
+    async def preload_rvc_model(self, model_name: str | None = None) -> str:
+        if not self.rvc_enabled:
+            raise RuntimeError("RVC 未启用")
+        async with self._synthesize_lock:
+            return await asyncio.to_thread(self._preload_rvc_model, model_name)
 
     # ------------------------------------------------------------------
     # 合成
@@ -860,14 +926,17 @@ class TTSService:
                 and self._check_cosyvoice_downloaded()
             )
 
-            use_cosy = target_engine == "cosyvoice" and cosy_available
-
-            if target_engine == "cosyvoice" and not cosy_available:
-                logger.warning(
-                    "CosyVoice2 不可用，fallback 到 edge_tts "
-                    "(import=%s, downloaded=%s)",
-                    self._check_cosyvoice_importable(),
-                    self._check_cosyvoice_downloaded(),
+            if target_engine not in {"cosyvoice", "edge_tts"}:
+                raise ValueError(f"不支持的 TTS 引擎: {target_engine}")
+            use_cosy = target_engine == "cosyvoice"
+            edge_available = self._check_edge_tts_available()
+            if use_cosy and not cosy_available:
+                raise ModelUpstreamError(
+                    "CosyVoice2 不可用，已停止自动切换引擎"
+                )
+            if not use_cosy and not edge_available:
+                raise ModelUpstreamError(
+                    "Edge TTS 不可用，已停止自动切换引擎"
                 )
 
             if use_cosy:
@@ -890,41 +959,14 @@ class TTSService:
                     self._array_to_wav, audio, sample_rate
                 )
             else:
-                if self._check_edge_tts_available():
-                    synth_voice = (
-                        voice if voice and voice in EDGE_CN_VOICES else None
-                    )
-                    try:
-                        audio, sample_rate = await self._synth_edge_tts(
-                            text, voice=synth_voice
-                        )
-                        self._engine_type = "edge_tts"
-                    except Exception as exc:
-                        if not cosy_available:
-                            raise ModelUpstreamError(
-                                "Edge TTS 调用失败，且本地 CosyVoice2 不可用"
-                            ) from exc
-                        logger.warning(
-                            "Edge TTS 不可用，fallback 到本地 CosyVoice2: %s",
-                            exc,
-                        )
-                        if self._cosyvoice_model is None:
-                            await asyncio.to_thread(self._init_cosyvoice)
-                        audio, sample_rate = await asyncio.to_thread(
-                            self._synth_cosyvoice, text
-                        )
-                        self._engine_type = "cosyvoice"
-                elif cosy_available:
-                    if self._cosyvoice_model is None:
-                        await asyncio.to_thread(self._init_cosyvoice)
-                    audio, sample_rate = await asyncio.to_thread(
-                        self._synth_cosyvoice, text
-                    )
-                    self._engine_type = "cosyvoice"
-                else:
-                    raise ModelUpstreamError(
-                        "TTS 引擎均不可用 (CosyVoice2 + edge-tts)"
-                    )
+                synth_voice = (
+                    voice if voice and voice in EDGE_CN_VOICES else None
+                )
+                audio, sample_rate = await self._synth_edge_tts(
+                    text,
+                    voice=synth_voice,
+                )
+                self._engine_type = "edge_tts"
                 if use_rvc and self._rvc_engine is None:
                     await asyncio.to_thread(self._init_rvc)
                 if self._rvc_engine is not None and use_rvc:
@@ -1047,18 +1089,20 @@ class TTSService:
             if use_rvc and self._rvc_engine is None:
                 await asyncio.to_thread(self._init_rvc)
 
-            if not edge_available and not cosy_available:
-                raise ModelUpstreamError(
-                    "TTS 引擎均不可用 (CosyVoice2 + edge-tts)"
-                )
-            if target_engine == "cosyvoice" and not cosy_available:
+            if target_engine not in {"cosyvoice", "edge_tts"}:
+                raise ValueError(f"不支持的 TTS 引擎: {target_engine}")
+            use_cosy = target_engine == "cosyvoice"
+            if use_cosy and not cosy_available:
                 detail = self._cosyvoice_import_error or "模型文件不完整"
                 raise ModelUpstreamError(
-                    f"CosyVoice2 不可用，已停止 Edge TTS 静默降级：{detail}"
+                    f"CosyVoice2 不可用，已停止自动切换引擎：{detail}"
+                )
+            if not use_cosy and not edge_available:
+                raise ModelUpstreamError(
+                    "Edge TTS 不可用，已停止自动切换引擎"
                 )
 
             async def source_segments() -> AsyncIterator[tuple[str, object, int, str]]:
-                use_cosy = target_engine == "cosyvoice" and cosy_available
                 if use_cosy and self._cosyvoice_model is None:
                     await asyncio.to_thread(self._init_cosyvoice)
                 if use_cosy:
@@ -1074,15 +1118,11 @@ class TTSService:
                         voice if voice and voice in EDGE_CN_VOICES else None
                     )
 
-                sentence_segments = _split_tts_sentences(text)
-                if use_cosy:
-                    sentence_segments = _group_sentence_segments(
-                        sentence_segments,
-                    )
-                    logger.info(
-                        "TTS sentence grouping: groups=%s",
-                        [len(item) for item in sentence_segments],
-                    )
+                sentence_segments = _group_tts_paragraphs(text)
+                logger.info(
+                    "TTS sentence grouping: groups=%s",
+                    [len(item) for item in sentence_segments],
+                )
 
                 for segment in sentence_segments:
                     started = time.perf_counter()
@@ -1096,40 +1136,12 @@ class TTSService:
                             tts_speed=cosy_speed,
                         )
                         self._engine_type = "cosyvoice"
-                    elif edge_available:
-                        try:
-                            audio, sample_rate = await self._synth_edge_tts(
-                                segment, voice=synth_voice
-                            )
-                            self._engine_type = "edge_tts"
-                        except Exception:
-                            if not cosy_available:
-                                raise
-                            if self._cosyvoice_model is None:
-                                await asyncio.to_thread(self._init_cosyvoice)
-                            active_prompt_wav, active_prompt_text = resolve_prompt()
-                            audio, sample_rate = await asyncio.to_thread(
-                                self._synth_cosyvoice,
-                                segment,
-                                prompt_wav=str(active_prompt_wav),
-                                prompt_text=active_prompt_text,
-                                prompt_id=prompt_id,
-                                tts_speed=cosy_speed,
-                            )
-                            self._engine_type = "cosyvoice"
                     else:
-                        if self._cosyvoice_model is None:
-                            await asyncio.to_thread(self._init_cosyvoice)
-                        active_prompt_wav, active_prompt_text = resolve_prompt()
-                        audio, sample_rate = await asyncio.to_thread(
-                            self._synth_cosyvoice,
+                        audio, sample_rate = await self._synth_edge_tts(
                             segment,
-                            prompt_wav=str(active_prompt_wav),
-                            prompt_text=active_prompt_text,
-                            prompt_id=prompt_id,
-                            tts_speed=cosy_speed,
+                            voice=synth_voice,
                         )
-                        self._engine_type = "cosyvoice"
+                        self._engine_type = "edge_tts"
 
                     yield segment, audio, sample_rate, self._engine_type
                     elapsed = time.perf_counter() - started

@@ -141,7 +141,7 @@ class LLMClient:
     ) -> list[dict[str, object]]:
         """Extract candidate stable user facts with a structured model call."""
         if not self.settings.model_configured:
-            logger.info("Long-term memory extraction skipped: model key missing")
+            logger.info("Long-term memory extraction skipped: model config missing")
             return []
         system = (
             "你是用户长期记忆提取器。只提取用户在消息中明确陈述、"

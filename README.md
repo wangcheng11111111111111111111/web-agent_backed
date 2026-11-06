@@ -227,7 +227,8 @@ START -> classify -> load_memory
 - PostgreSQL 使用 `schema_migrations` 记录版本和 SHA-256 校验和，避免重复执行或静默修改迁移。
 - `user_facts` 以 `(tenant_id, user_id, content_hash)` 建立活跃事实唯一约束，并记录重要度、访问次数、最后访问时间和过期时间。
 - Qdrant 为 `tenant_id`、`user_id`、`fact_type`、`is_active` 建立 payload 索引。
-- 助手名称、Logo 文件名和背景状态存于 `app_settings`；图片写入
+- 单用户模式下，助手名称、Logo 文件名和背景状态统一存于
+  `client_branding` 的 `GLOBAL_CLIENT_ID`；图片写入
   `data/branding/`，视频写入 `data/backgrounds/`。
 - 图片格式支持 PNG、JPEG、WebP、GIF。
 - 视频上传按 1 MB 分块流式写盘，最大 10 GB，不会整体载入 Python 内存。

@@ -28,304 +28,265 @@ SYSTEM_RULES_PROMPT: str = (
 DEFAULT_SYSTEM_PROMPT: str = DEFAULT_PERSONALITY_PROMPT + SYSTEM_RULES_PROMPT
 
 
-def _int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
+class ConfigError(RuntimeError):
+    pass
 
 
-def _float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except ValueError:
-        return default
+def _required(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        raise ConfigError(f"缺少必需的环境变量：{name}")
+    return value.strip()
 
 
-def _bool(name: str, default: bool) -> bool:
+def _allow_empty(name: str) -> str:
     value = os.getenv(name)
     if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+        raise ConfigError(f"缺少环境变量：{name}")
+    return value.strip()
+
+
+def _int(name: str) -> int:
+    try:
+        return int(_required(name))
+    except ValueError as exc:
+        raise ConfigError(f"环境变量 {name} 必须是整数") from exc
+
+
+def _float(name: str) -> float:
+    try:
+        return float(_required(name))
+    except ValueError as exc:
+        raise ConfigError(f"环境变量 {name} 必须是数字") from exc
+
+
+def _bool(name: str) -> bool:
+    value = _required(name).lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"环境变量 {name} 必须是布尔值")
+
+
+def _str(name: str) -> str:
+    return _required(name)
+
+
+def _url(name: str) -> str:
+    return _str(name).rstrip("/")
+
+
+def _list(name: str) -> tuple[str, ...]:
+    values = tuple(item.strip() for item in _str(name).split(",") if item.strip())
+    if not values:
+        raise ConfigError(f"环境变量 {name} 不能为空")
+    return values
 
 
 @dataclass(frozen=True)
 class Settings:
-    app_env: str = field(default_factory=lambda: os.getenv("APP_ENV", "development"))
-    api_host: str = field(default_factory=lambda: os.getenv("API_HOST", "0.0.0.0"))
-    api_port: int = field(default_factory=lambda: _int("API_PORT", 8000))
+    app_env: str = field(default_factory=lambda: _str("APP_ENV"))
+    api_host: str = field(default_factory=lambda: _str("API_HOST"))
+    api_port: int = field(default_factory=lambda: _int("API_PORT"))
     cors_origins: tuple[str, ...] = field(
-        default_factory=lambda: tuple(
-            item.strip()
-            for item in os.getenv(
-                "CORS_ORIGINS",
-                "http://127.0.0.1:5173,http://localhost:5173",
-            ).split(",")
-            if item.strip()
-        )
+        default_factory=lambda: _list("CORS_ORIGINS")
+    )
+    global_client_id: str = field(
+        default_factory=lambda: _str("GLOBAL_CLIENT_ID")
+    )
+    global_tenant_id: str = field(
+        default_factory=lambda: _str("GLOBAL_TENANT_ID")
+    )
+    global_user_id: str = field(
+        default_factory=lambda: _str("GLOBAL_USER_ID")
     )
 
     llm_api_key: str = field(
-        default_factory=lambda: os.getenv("LLM_API_KEY", "").strip(),
-        repr=False,
+        default_factory=lambda: _allow_empty("LLM_API_KEY"), repr=False
     )
-    llm_base_url: str = field(
-        default_factory=lambda: os.getenv(
-            "LLM_BASE_URL", "https://api.deepseek.com/v1"
-        ).rstrip("/")
-    )
-    llm_model: str = field(
-        default_factory=lambda: os.getenv("LLM_MODEL", "deepseek-chat")
-    )
-    llm_timeout: float = field(
-        default_factory=lambda: _float("LLM_TIMEOUT", 60.0)
-    )
+    llm_base_url: str = field(default_factory=lambda: _url("LLM_BASE_URL"))
+    llm_model: str = field(default_factory=lambda: _str("LLM_MODEL"))
+    llm_timeout: float = field(default_factory=lambda: _float("LLM_TIMEOUT"))
 
-    pg_host: str = field(default_factory=lambda: os.getenv("PG_HOST", "127.0.0.1"))
-    pg_port: int = field(default_factory=lambda: _int("PG_PORT", 5432))
-    pg_database: str = field(
-        default_factory=lambda: os.getenv("PG_DATABASE", "ai_assistant")
-    )
-    pg_username: str = field(
-        default_factory=lambda: os.getenv("PG_USERNAME", "ai_assistant")
-    )
+    pg_host: str = field(default_factory=lambda: _str("PG_HOST"))
+    pg_port: int = field(default_factory=lambda: _int("PG_PORT"))
+    pg_database: str = field(default_factory=lambda: _str("PG_DATABASE"))
+    pg_username: str = field(default_factory=lambda: _str("PG_USERNAME"))
     pg_password: str = field(
-        default_factory=lambda: os.getenv("PG_PASSWORD", ""),
+        default_factory=lambda: _allow_empty("PG_PASSWORD"),
         repr=False,
     )
-    pg_sslmode: str = field(
-        default_factory=lambda: os.getenv("PG_SSLMODE", "prefer")
-    )
+    pg_sslmode: str = field(default_factory=lambda: _str("PG_SSLMODE"))
 
-    redis_host: str = field(
-        default_factory=lambda: os.getenv("REDIS_HOST", "127.0.0.1")
-    )
-    redis_port: int = field(default_factory=lambda: _int("REDIS_PORT", 6379))
-    redis_db: int = field(default_factory=lambda: _int("REDIS_DB", 0))
+    redis_host: str = field(default_factory=lambda: _str("REDIS_HOST"))
+    redis_port: int = field(default_factory=lambda: _int("REDIS_PORT"))
+    redis_db: int = field(default_factory=lambda: _int("REDIS_DB"))
     redis_password: str = field(
-        default_factory=lambda: os.getenv("REDIS_PASSWORD", ""),
+        default_factory=lambda: _allow_empty("REDIS_PASSWORD"),
         repr=False,
     )
-    redis_enabled: bool = field(
-        default_factory=lambda: _bool("REDIS_ENABLED", True)
-    )
+    redis_enabled: bool = field(default_factory=lambda: _bool("REDIS_ENABLED"))
     session_ttl_seconds: int = field(
-        default_factory=lambda: _int("SESSION_TTL_SECONDS", 604800)
+        default_factory=lambda: _int("SESSION_TTL_SECONDS")
     )
     short_term_message_limit: int = field(
-        default_factory=lambda: _int("SHORT_TERM_MESSAGE_LIMIT", 40)
+        default_factory=lambda: _int("SHORT_TERM_MESSAGE_LIMIT")
     )
     conversation_recall_enabled: bool = field(
-        default_factory=lambda: _bool("CONVERSATION_RECALL_ENABLED", True)
+        default_factory=lambda: _bool("CONVERSATION_RECALL_ENABLED")
     )
     conversation_recall_scan: int = field(
-        default_factory=lambda: _int("CONVERSATION_RECALL_SCAN", 200)
+        default_factory=lambda: _int("CONVERSATION_RECALL_SCAN")
     )
     conversation_recall_limit: int = field(
-        default_factory=lambda: _int("CONVERSATION_RECALL_LIMIT", 6)
+        default_factory=lambda: _int("CONVERSATION_RECALL_LIMIT")
     )
     conversation_recall_max_chars: int = field(
-        default_factory=lambda: _int("CONVERSATION_RECALL_MAX_CHARS", 2400)
+        default_factory=lambda: _int("CONVERSATION_RECALL_MAX_CHARS")
     )
     background_media_root: str = field(
-        default_factory=lambda: os.getenv(
-            "BACKGROUND_MEDIA_ROOT",
-            str(BACKEND_DIR / "data" / "backgrounds"),
-        )
+        default_factory=lambda: _str("BACKGROUND_MEDIA_ROOT")
     )
     max_background_video_mb: int = field(
-        default_factory=lambda: _int("MAX_BACKGROUND_VIDEO_MB", 10240)
+        default_factory=lambda: _int("MAX_BACKGROUND_VIDEO_MB")
     )
     brand_media_root: str = field(
-        default_factory=lambda: os.getenv(
-            "BRAND_MEDIA_ROOT",
-            str(BACKEND_DIR / "data" / "branding"),
-        )
+        default_factory=lambda: _str("BRAND_MEDIA_ROOT")
     )
 
-    qdrant_host: str = field(
-        default_factory=lambda: os.getenv("QDRANT_HOST", "127.0.0.1")
-    )
-    qdrant_port: int = field(default_factory=lambda: _int("QDRANT_PORT", 6333))
+    qdrant_host: str = field(default_factory=lambda: _str("QDRANT_HOST"))
+    qdrant_port: int = field(default_factory=lambda: _int("QDRANT_PORT"))
     qdrant_collection: str = field(
-        default_factory=lambda: os.getenv("QDRANT_COLLECTION", "knowledge_base")
+        default_factory=lambda: _str("QDRANT_COLLECTION")
     )
     qdrant_api_key: str = field(
-        default_factory=lambda: os.getenv("QDRANT_API_KEY", "").strip(),
-        repr=False,
+        default_factory=lambda: _allow_empty("QDRANT_API_KEY"), repr=False
     )
-    qdrant_timeout: float = field(
-        default_factory=lambda: _float("QDRANT_TIMEOUT", 10.0)
-    )
+    qdrant_timeout: float = field(default_factory=lambda: _float("QDRANT_TIMEOUT"))
 
     embedding_base_url: str = field(
-        default_factory=lambda: os.getenv(
-            "EMBEDDING_BASE_URL", "https://api.siliconflow.cn/v1"
-        ).rstrip("/")
+        default_factory=lambda: _url("EMBEDDING_BASE_URL")
     )
     embedding_api_key: str = field(
-        default_factory=lambda: os.getenv("EMBEDDING_API_KEY", "").strip(),
+        default_factory=lambda: _allow_empty("EMBEDDING_API_KEY"),
         repr=False,
     )
-    embedding_model: str = field(
-        default_factory=lambda: os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
-    )
-    embedding_dim: int = field(
-        default_factory=lambda: _int("EMBEDDING_DIM", 1024)
-    )
+    embedding_model: str = field(default_factory=lambda: _str("EMBEDDING_MODEL"))
+    embedding_dim: int = field(default_factory=lambda: _int("EMBEDDING_DIM"))
     embedding_timeout: float = field(
-        default_factory=lambda: _float("EMBEDDING_TIMEOUT", 30.0)
+        default_factory=lambda: _float("EMBEDDING_TIMEOUT")
     )
 
-    rag_top_k: int = field(default_factory=lambda: _int("RAG_TOP_K", 5))
+    rag_top_k: int = field(default_factory=lambda: _int("RAG_TOP_K"))
     rag_score_threshold: float = field(
-        default_factory=lambda: _float("RAG_SCORE_THRESHOLD", 0.45)
+        default_factory=lambda: _float("RAG_SCORE_THRESHOLD")
     )
     rag_chunk_size: int = field(
-        default_factory=lambda: _int("RAG_CHUNK_SIZE", 900)
+        default_factory=lambda: _int("RAG_CHUNK_SIZE")
     )
     rag_chunk_overlap: int = field(
-        default_factory=lambda: _int("RAG_CHUNK_OVERLAP", 120)
+        default_factory=lambda: _int("RAG_CHUNK_OVERLAP")
     )
     max_upload_mb: int = field(
-        default_factory=lambda: _int("MAX_UPLOAD_MB", 10)
+        default_factory=lambda: _int("MAX_UPLOAD_MB")
     )
 
-    memory_enabled: bool = field(
-        default_factory=lambda: _bool("MEMORY_ENABLED", True)
-    )
+    memory_enabled: bool = field(default_factory=lambda: _bool("MEMORY_ENABLED"))
     memory_collection: str = field(
-        default_factory=lambda: os.getenv("MEMORY_COLLECTION", "user_memory")
+        default_factory=lambda: _str("MEMORY_COLLECTION")
     )
-    memory_top_k: int = field(
-        default_factory=lambda: _int("MEMORY_TOP_K", 5)
-    )
+    memory_top_k: int = field(default_factory=lambda: _int("MEMORY_TOP_K"))
     memory_retrieval_threshold: float = field(
-        default_factory=lambda: _float("MEMORY_RETRIEVAL_THRESHOLD", 0.35)
+        default_factory=lambda: _float("MEMORY_RETRIEVAL_THRESHOLD")
     )
     memory_dedup_threshold: float = field(
-        default_factory=lambda: _float("MEMORY_DEDUP_THRESHOLD", 0.92)
+        default_factory=lambda: _float("MEMORY_DEDUP_THRESHOLD")
     )
     memory_correction_threshold: float = field(
-        default_factory=lambda: _float("MEMORY_CORRECTION_THRESHOLD", 0.68)
+        default_factory=lambda: _float("MEMORY_CORRECTION_THRESHOLD")
     )
     memory_recency_days: int = field(
-        default_factory=lambda: _int("MEMORY_RECENCY_DAYS", 90)
+        default_factory=lambda: _int("MEMORY_RECENCY_DAYS")
     )
     memory_min_confidence: float = field(
-        default_factory=lambda: _float("MEMORY_MIN_CONFIDENCE", 0.60)
+        default_factory=lambda: _float("MEMORY_MIN_CONFIDENCE")
     )
-    memory_max_facts: int = field(
-        default_factory=lambda: _int("MEMORY_MAX_FACTS", 5)
-    )
+    memory_max_facts: int = field(default_factory=lambda: _int("MEMORY_MAX_FACTS"))
     memory_min_content_chars: int = field(
-        default_factory=lambda: _int("MEMORY_MIN_CONTENT_CHARS", 4)
+        default_factory=lambda: _int("MEMORY_MIN_CONTENT_CHARS")
     )
     memory_max_content_chars: int = field(
-        default_factory=lambda: _int("MEMORY_MAX_CONTENT_CHARS", 800)
+        default_factory=lambda: _int("MEMORY_MAX_CONTENT_CHARS")
     )
 
     web_search_enabled: bool = field(
-        default_factory=lambda: _bool("WEB_SEARCH_ENABLED", True)
+        default_factory=lambda: _bool("WEB_SEARCH_ENABLED")
     )
     web_search_provider: str = field(
-        default_factory=lambda: os.getenv(
-            "WEB_SEARCH_PROVIDER", "bing"
-        ).strip().lower()
+        default_factory=lambda: _str("WEB_SEARCH_PROVIDER").lower()
     )
     web_search_api_key: str = field(
-        default_factory=lambda: os.getenv("WEB_SEARCH_API_KEY", "").strip(),
+        default_factory=lambda: _allow_empty("WEB_SEARCH_API_KEY"),
         repr=False,
     )
     web_search_top_k: int = field(
-        default_factory=lambda: _int("WEB_SEARCH_TOP_K", 5)
+        default_factory=lambda: _int("WEB_SEARCH_TOP_K")
     )
     web_search_timeout: float = field(
-        default_factory=lambda: _float("WEB_SEARCH_TIMEOUT", 15.0)
+        default_factory=lambda: _float("WEB_SEARCH_TIMEOUT")
     )
 
     web_crawl_enabled: bool = field(
-        default_factory=lambda: _bool("WEB_CRAWL_ENABLED", True)
+        default_factory=lambda: _bool("WEB_CRAWL_ENABLED")
     )
     web_crawl_timeout: float = field(
-        default_factory=lambda: _float("WEB_CRAWL_TIMEOUT", 20.0)
+        default_factory=lambda: _float("WEB_CRAWL_TIMEOUT")
     )
     web_crawl_max_chars: int = field(
-        default_factory=lambda: _int("WEB_CRAWL_MAX_CHARS", 4000)
+        default_factory=lambda: _int("WEB_CRAWL_MAX_CHARS")
     )
 
-    tts_enabled: bool = field(
-        default_factory=lambda: _bool("TTS_ENABLED", False)
-    )
+    tts_enabled: bool = field(default_factory=lambda: _bool("TTS_ENABLED"))
     local_tts_engine: str = field(
-        default_factory=lambda: os.getenv("LOCAL_TTS_ENGINE", "auto").strip().lower()
+        default_factory=lambda: _str("LOCAL_TTS_ENGINE").lower()
     )
     local_tts_model_dir: str = field(
-        default_factory=lambda: os.getenv(
-            "LOCAL_TTS_MODEL_DIR",
-            str(BACKEND_DIR / "models" / "cosyvoice2"),
-        )
+        default_factory=lambda: _str("LOCAL_TTS_MODEL_DIR")
     )
     local_tts_device: str = field(
-        default_factory=lambda: os.getenv("LOCAL_TTS_DEVICE", "cuda").strip().lower()
+        default_factory=lambda: _str("LOCAL_TTS_DEVICE").lower()
     )
     local_rvc_model_dir: str = field(
-        default_factory=lambda: os.getenv(
-            "LOCAL_RVC_MODEL_DIR",
-            str(BACKEND_DIR / "models" / "rvc" / "weights"),
-        )
+        default_factory=lambda: _str("LOCAL_RVC_MODEL_DIR")
     )
     local_rvc_index_dir: str = field(
-        default_factory=lambda: os.getenv(
-            "LOCAL_RVC_INDEX_DIR",
-            str(BACKEND_DIR / "models" / "rvc" / "indexes"),
-        )
+        default_factory=lambda: _str("LOCAL_RVC_INDEX_DIR")
     )
     local_rvc_device: str = field(
-        default_factory=lambda: os.getenv("LOCAL_RVC_DEVICE", "cuda").strip().lower()
+        default_factory=lambda: _str("LOCAL_RVC_DEVICE").lower()
     )
 
-    stt_enabled: bool = field(
-        default_factory=lambda: _bool("STT_ENABLED", False)
-    )
-    stt_device: str = field(
-        default_factory=lambda: os.getenv(
-            "STT_DEVICE", "auto"
-        ).strip().lower()
-    )
+    stt_enabled: bool = field(default_factory=lambda: _bool("STT_ENABLED"))
+    stt_device: str = field(default_factory=lambda: _str("STT_DEVICE").lower())
     stt_whisper_model: str = field(
-        default_factory=lambda: os.getenv(
-            "STT_WHISPER_MODEL", "small"
-        ).strip().lower()
+        default_factory=lambda: _str("STT_WHISPER_MODEL").lower()
     )
-    stt_base_url: str = field(
-        default_factory=lambda: os.getenv(
-            "STT_BASE_URL", "https://api.siliconflow.cn/v1"
-        ).rstrip("/")
-    )
+    stt_base_url: str = field(default_factory=lambda: _url("STT_BASE_URL"))
     stt_api_key: str = field(
-        default_factory=lambda: os.getenv(
-            "STT_API_KEY", os.getenv("EMBEDDING_API_KEY", "")
-        ).strip(),
+        default_factory=lambda: _allow_empty("STT_API_KEY"),
         repr=False,
     )
-    stt_model: str = field(
-        default_factory=lambda: os.getenv(
-            "STT_MODEL", "FunAudioLLM/SenseVoiceSmall"
-        )
-    )
-    stt_timeout: float = field(
-        default_factory=lambda: _float("STT_TIMEOUT", 30.0)
-    )
+    stt_model: str = field(default_factory=lambda: _str("STT_MODEL"))
+    stt_timeout: float = field(default_factory=lambda: _float("STT_TIMEOUT"))
 
     @property
     def database_dsn(self) -> str:
-        sslmode = self.pg_sslmode or "prefer"
         return (
             f"postgresql://{quote_plus(self.pg_username)}:"
             f"{quote_plus(self.pg_password)}@{self.pg_host}:{self.pg_port}/"
             f"{quote_plus(self.pg_database)}"
-            f"?sslmode={sslmode}"
+            f"?sslmode={self.pg_sslmode}"
         )
 
     @property
@@ -348,11 +309,24 @@ class Settings:
 
     @property
     def model_configured(self) -> bool:
-        return bool(self.llm_api_key)
+        return bool(self.llm_api_key and self.llm_base_url and self.llm_model)
 
     @property
     def embeddings_configured(self) -> bool:
-        return bool(self.embedding_api_key)
+        return bool(
+            self.embedding_api_key
+            and self.embedding_base_url
+            and self.embedding_model
+        )
+
+    @property
+    def remote_stt_configured(self) -> bool:
+        return bool(
+            self.stt_enabled
+            and self.stt_api_key
+            and self.stt_base_url
+            and self.stt_model
+        )
 
 
 @lru_cache(maxsize=1)

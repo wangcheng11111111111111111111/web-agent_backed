@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
+from urllib.parse import urlencode
 from uuid import UUID
 
 # ONNX Runtime emits provider fallback diagnostics directly from its native
@@ -61,10 +62,10 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(venv_site_packages))
 
 from app.agent.graph import AssistantGraph
-from app.storage.branding_store import BrandingStore
+from app.storage.client_branding_store import BrandingStore
 from app.config import DEFAULT_PERSONALITY_PROMPT, Settings, get_settings
 from app.database import Database
-from app.errors import AppError, DatabaseUnavailableError
+from app.errors import AppError
 from app.storage.media_storage import MediaStorage
 from app.storage.prompt_store import PromptStore
 from app.storage.repositories import (
@@ -200,24 +201,28 @@ def _document_out(document: Any) -> DocumentOut:
     )
 
 
-def _branding_out(branding: Any) -> BrandingOut:
+def _branding_out(branding: Any, client_id: str) -> BrandingOut:
     version = (
         str(int(branding.updated_at.timestamp() * 1_000_000))
         if branding.updated_at is not None
         else "default"
     )
+
+    def asset_url(path: str) -> str:
+        return f"{path}?{urlencode({'client_id': client_id, 'v': version})}"
+
     background_url: str | None = None
     if branding.background_enabled:
         if branding.background_type == "video" and branding.background_video_file:
-            background_url = (
-                f"/api/settings/branding/background/video?v={version}"
+            background_url = asset_url(
+                "/api/settings/branding/background/video"
             )
         elif branding.background_type == "image" and branding.logo_file:
-            background_url = f"/api/settings/branding/logo?v={version}"
+            background_url = asset_url("/api/settings/branding/logo")
     return BrandingOut(
         name=branding.name,
         logo_url=(
-            f"/api/settings/branding/logo?v={version}"
+            asset_url("/api/settings/branding/logo")
             if branding.logo_file
             else None
         ),
@@ -231,14 +236,14 @@ def _branding_out(branding: Any) -> BrandingOut:
 CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 
-def _client_id(request: Request) -> str:
-    value = request.headers.get("X-Client-ID", "anonymous").strip()
+def _client_id(request: Request, *, allow_query: bool = False) -> str:
+    value = request.app.state.container.settings.global_client_id
     if not CLIENT_ID_PATTERN.fullmatch(value):
         raise HTTPException(
             status_code=400,
             detail={
                 "code": "invalid_client_id",
-                "message": "X-Client-ID 蹇呴』鏄?8-64 浣嶅瓧姣嶃€佹暟瀛椼€佷笅鍒掔嚎鎴栬繛瀛楃",
+                "message": "GLOBAL_CLIENT_ID 必须是 8-64 位字母、数字、下划线或连字符",
             },
         )
     return value
@@ -246,9 +251,13 @@ def _client_id(request: Request) -> str:
 
 def _identity(request: Request) -> tuple[str, str, str]:
     client_id = _client_id(request)
-    tenant_id = request.headers.get("X-Tenant-ID", "default-tenant").strip()
-    user_id = request.headers.get("X-User-ID", client_id).strip()
-    for name, value in (("X-Tenant-ID", tenant_id), ("X-User-ID", user_id)):
+    settings = request.app.state.container.settings
+    tenant_id = settings.global_tenant_id
+    user_id = settings.global_user_id
+    for name, value in (
+        ("GLOBAL_TENANT_ID", tenant_id),
+        ("GLOBAL_USER_ID", user_id),
+    ):
         if not CLIENT_ID_PATTERN.fullmatch(value):
             raise HTTPException(
                 status_code=400,
@@ -307,42 +316,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             resolved_settings.redis_host,
             resolved_settings.redis_port,
         )
-        try:
-            await container.database.connect()
-            logger.info("PostgreSQL connection pool initialized")
-        except DatabaseUnavailableError:
-            logger.warning(
-                "PostgreSQL is not connected at startup; "
-                "health and docs remain available"
-            )
-        try:
-            branding = await container.branding_store.get()
-            if (
-                branding.logo_file
-                and container.media_storage.media_path(
-                    "branding", branding.logo_file
-                )
-                is None
-            ):
-                legacy = await container.branding_store.get_legacy_logo(
-                    branding.logo_file
-                )
-                if legacy is not None:
-                    content, _ = legacy
-                    stored = await container.media_storage.save_legacy_image(
-                        branding.logo_file,
-                        content,
-                    )
-                    await container.branding_store.set_logo(stored.filename)
-                    await container.branding_store.delete_legacy_logo(
-                        branding.logo_file
-                    )
-                    logger.info("Migrated legacy branding image to disk")
-        except Exception as exc:
-            logger.warning(
-                "Legacy branding image migration skipped (%s)",
-                type(exc).__name__,
-            )
         try:
             await container.short_term_memory.connect()
         except Exception:
@@ -430,8 +403,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         tags=["settings"],
     )
     async def get_branding(request: Request) -> BrandingOut:
-        branding = await request.app.state.container.branding_store.get()
-        return _branding_out(branding)
+        client_id = _client_id(request)
+        branding = await request.app.state.container.branding_store.get(client_id)
+        return _branding_out(branding, client_id)
 
     @app.put(
         "/api/settings/branding",
@@ -442,13 +416,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload: BrandingUpdate,
         request: Request,
     ) -> BrandingOut:
+        client_id = _client_id(request)
         try:
             branding = await request.app.state.container.branding_store.set_name(
+                client_id,
                 payload.name
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return _branding_out(branding)
+        return _branding_out(branding, client_id)
 
     @app.put(
         "/api/settings/branding/background",
@@ -459,14 +435,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload: BackgroundUpdate,
         request: Request,
     ) -> BrandingOut:
+        client_id = _client_id(request)
         try:
             branding = await request.app.state.container.branding_store.set_background(
+                client_id,
                 payload.enabled,
                 payload.background_type,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return _branding_out(branding)
+        return _branding_out(branding, client_id)
 
     @app.post(
         "/api/settings/branding/logo",
@@ -478,6 +456,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         file: UploadFile = File(...),
     ) -> BrandingOut:
         state = request.app.state.container
+        client_id = _client_id(request)
         maximum = 5 * 1024 * 1024
         content = await file.read(maximum + 1)
         await file.close()
@@ -500,15 +479,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 },
             ) from exc
         try:
-            branding = await state.branding_store.set_logo(stored.filename)
+            branding = await state.branding_store.set_logo(
+                client_id,
+                stored.filename,
+            )
         except Exception:
             await state.media_storage.delete("branding", stored.filename)
             raise
-        return _branding_out(branding)
+        return _branding_out(branding, client_id)
 
     @app.get("/api/settings/branding/logo", tags=["settings"])
     async def get_branding_logo(request: Request) -> FileResponse:
-        branding = await request.app.state.container.branding_store.get()
+        client_id = _client_id(request, allow_query=True)
+        branding = await request.app.state.container.branding_store.get(client_id)
         if not branding.logo_file:
             raise HTTPException(status_code=404, detail="助手图片不存在")
         target = request.app.state.container.media_storage.media_path(
@@ -529,10 +512,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     async def reset_branding_logo(request: Request) -> BrandingOut:
         state = request.app.state.container
-        previous = await state.branding_store.get()
-        branding = await state.branding_store.clear_logo()
+        client_id = _client_id(request)
+        previous = await state.branding_store.get(client_id)
+        branding = await state.branding_store.clear_logo(client_id)
         await state.media_storage.delete("branding", previous.logo_file)
-        return _branding_out(branding)
+        return _branding_out(branding, client_id)
 
     @app.post(
         "/api/settings/branding/background/video",
@@ -544,6 +528,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         file: UploadFile = File(...),
     ) -> BrandingOut:
         state = request.app.state.container
+        client_id = _client_id(request)
         try:
             stored = await state.media_storage.save_video(file)
         except ValueError as exc:
@@ -552,15 +537,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail={"code": "invalid_video", "message": str(exc)},
             ) from exc
         try:
-            branding = await state.branding_store.set_video(stored.filename)
+            branding = await state.branding_store.set_video(
+                client_id,
+                stored.filename,
+            )
         except Exception:
             await state.media_storage.delete("backgrounds", stored.filename)
             raise
-        return _branding_out(branding)
+        return _branding_out(branding, client_id)
 
     @app.get("/api/settings/branding/background/video", tags=["settings"])
     async def get_background_video(request: Request) -> FileResponse:
-        branding = await request.app.state.container.branding_store.get()
+        client_id = _client_id(request, allow_query=True)
+        branding = await request.app.state.container.branding_store.get(client_id)
         if not branding.background_video_file:
             raise HTTPException(status_code=404, detail="背景视频不存在")
         target = request.app.state.container.media_storage.media_path(
@@ -587,7 +576,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     async def list_branding_media(request: Request) -> list[BrandingMediaOut]:
         state = request.app.state.container
-        branding = await state.branding_store.get()
+        client_id = _client_id(request)
+        branding = await state.branding_store.get(client_id)
         media: list[BrandingMediaOut] = []
         for kind, directory in (
             ("image", "branding"),
@@ -610,7 +600,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     BrandingMediaOut(
                         kind=kind,  # type: ignore[arg-type]
                         filename=filename,
-                        url=f"/api/settings/branding/media/{kind}/{filename}",
+                        url=(
+                            f"/api/settings/branding/media/{kind}/{filename}"
+                            f"?{urlencode({'client_id': client_id})}"
+                        ),
                         size_bytes=int(item["size_bytes"]),
                         created_at=item["created_at"],  # type: ignore[arg-type]
                         usage=usage,
@@ -629,19 +622,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
     ) -> BrandingOut:
         state = request.app.state.container
+        client_id = _client_id(request)
         directory = "branding" if payload.kind == "image" else "backgrounds"
         if state.media_storage.media_path(directory, payload.filename) is None:
             raise HTTPException(status_code=404, detail="媒体文件不存在")
         if payload.kind == "video":
-            branding = await state.branding_store.set_video(payload.filename)
+            branding = await state.branding_store.set_video(
+                client_id,
+                payload.filename,
+            )
         else:
-            branding = await state.branding_store.set_logo(payload.filename)
+            branding = await state.branding_store.set_logo(
+                client_id,
+                payload.filename,
+            )
             if payload.target == "background":
                 branding = await state.branding_store.set_background(
+                    client_id,
                     True,
                     "image",
                 )
-        return _branding_out(branding)
+        return _branding_out(branding, client_id)
 
     @app.get("/api/settings/branding/media/{kind}/{filename}", tags=["settings"])
     async def get_branding_media(
@@ -649,6 +650,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         filename: str,
         request: Request,
     ) -> FileResponse:
+        _client_id(request, allow_query=True)
         directory = "branding" if kind == "image" else "backgrounds"
         target = request.app.state.container.media_storage.media_path(
             directory,
@@ -687,16 +689,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
     ) -> BrandingOut:
         state = request.app.state.container
+        client_id = _client_id(request)
         directory = "branding" if kind == "image" else "backgrounds"
         if state.media_storage.media_path(directory, filename) is None:
             raise HTTPException(status_code=404, detail="媒体文件不存在")
-        branding = await state.branding_store.get()
+        branding = await state.branding_store.get(client_id)
         if kind == "image" and filename == branding.logo_file:
-            branding = await state.branding_store.clear_logo()
+            branding = await state.branding_store.clear_logo(client_id)
         elif kind == "video" and filename == branding.background_video_file:
-            branding = await state.branding_store.clear_video()
+            branding = await state.branding_store.clear_video(client_id)
         await state.media_storage.delete(directory, filename)
-        return _branding_out(branding)
+        return _branding_out(branding, client_id)
 
     @app.post("/api/chat", response_model=ChatResponse, tags=["chat"])
     async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
@@ -1413,6 +1416,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         model_dir.mkdir(parents=True, exist_ok=True)
         index_dir.mkdir(parents=True, exist_ok=True)
         return JSONResponse({"models": models})
+
+    @app.post("/api/audio/rvc/preload", tags=["audio"])
+    async def preload_rvc_model(
+        request: Request,
+        model_name: str = "",
+    ) -> JSONResponse:
+        tts: TTSService = request.app.state.container.tts
+        safe_name = Path(model_name).name if model_name else ""
+        if model_name and (not safe_name or safe_name != model_name):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_model_name", "message": "模型名称无效"},
+            )
+        try:
+            loaded = await tts.preload_rvc_model(safe_name or None)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "rvc_preload_failed", "message": str(exc)},
+            ) from exc
+        return JSONResponse({"preloaded": True, "model_name": loaded})
 
     @app.post("/api/audio/rvc/models", tags=["audio"])
     async def upload_rvc_model(
