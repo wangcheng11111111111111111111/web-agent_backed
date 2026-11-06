@@ -42,7 +42,7 @@ $missing = @(
     }
 )
 if ($missing.Count -gt 0) {
-    throw "缺少语音模型文件：" + ($missing -join ", ") + "。请按照 DOCKER.md 准备模型目录。"
+    throw "缺少语音模型文件：" + ($missing -join ", ") + "。请按照 README.md 准备模型目录。"
 }
 
 $rvcModels = @(Get-ChildItem -LiteralPath (Join-Path $Backend "models/rvc/weights") -Filter "*.pth" -File -ErrorAction SilentlyContinue)

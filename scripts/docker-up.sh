@@ -36,7 +36,7 @@ for file in \
   "$BACKEND_DIR/vendor/RVC/assets/rmvpe/rmvpe.pt"
 do
   if [ ! -f "$file" ]; then
-    echo "Missing model file: $file. See DOCKER.md." >&2
+    echo "Missing model file: $file. See README.md." >&2
     exit 1
   fi
 done

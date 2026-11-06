@@ -35,7 +35,7 @@ git clone https://github.com/wangcheng11111111111111111111/web-agent_backed.git
 cd web-agent_backed
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements-dev.txt
+python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 # 编辑 .env 后：
 python scripts/migrate.py
@@ -53,7 +53,7 @@ python scripts/download_models.py
 
 该脚本下载 CosyVoice2、HuBERT 和 RMVPE；用户自己的 RVC `.pth` 和 `.index`
 不会被自动下载，需要放入 `models/rvc/weights/` 与 `models/rvc/indexes/`。
-完整清单和目录树见 [MODELS.md](MODELS.md)。
+完整目录结构见下方“本地朗读”。
 
 也可以在 PyCharm 中直接运行 `app/main.py`，或执行：
 
@@ -66,9 +66,18 @@ python app/main.py
 
 ### Docker 一键启动
 
-先将前端仓库检出为本仓库同级的 `frontend/` 目录，填写 `.env` 后执行：
+环境要求：Docker Desktop/Engine、Compose v2、NVIDIA 驱动，以及 Docker 的
+WSL2/Container Toolkit GPU 支持。建议至少 10 GB 显存、32 GB 内存和 20 GB
+空闲磁盘。先确认 GPU 可用：
 
 ```powershell
+docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu24.04 nvidia-smi
+```
+
+将前端仓库检出为本仓库同级的 `frontend/` 目录，复制并填写配置，然后启动：
+
+```powershell
+Copy-Item .env.example .env
 .\scripts\docker-up.ps1
 ```
 
@@ -79,8 +88,19 @@ sh scripts/docker-up.sh
 ```
 
 Compose 会启动 PostgreSQL、Redis、Qdrant、数据库迁移、GPU 后端和 Nginx 前端，
-默认访问地址为 `http://127.0.0.1:8080`。GPU、模型目录、端口与排障说明见
-[DOCKER.md](DOCKER.md)。
+默认访问地址为 `http://127.0.0.1:8080`。数据库端口只绑定到本机
+`127.0.0.1`：PostgreSQL `5432`、Redis `6379`、Qdrant `6333/6334`。
+
+常用命令：
+
+```powershell
+docker compose --env-file .env ps
+docker compose --env-file .env logs -f backend frontend
+docker compose --env-file .env down
+```
+
+`down` 不会删除模型和命名数据卷；只有明确执行 `down -v` 才会删除数据库和
+向量数据。模型缺失时先运行 `python scripts/download_models.py`，再执行一键脚本。
 
 `GET /api/health` 不依赖模型、Redis、PostgreSQL 或 Qdrant。聊天与历史会话需要
 PostgreSQL；Redis 不可用时自动回源 PostgreSQL；知识库上传和语义检索需要
@@ -88,8 +108,21 @@ Embedding 密钥及 Qdrant。
 
 ## 本地朗读
 
-CosyVoice2 需要已下载的模型和 CUDA 版 PyTorch。RVC 本地音色还需要以下公开
-推理资源，目录结构必须保持一致：
+CosyVoice2 需要以下模型目录；默认从 ModelScope `iic/CosyVoice2-0.5B`
+下载，下载脚本失败时会回退到 Hugging Face `FunAudioLLM/CosyVoice2-0.5B`：
+
+```text
+models/cosyvoice2/
+├── cosyvoice2.yaml
+├── llm.pt
+├── flow.pt
+├── hift.pt
+├── campplus.onnx
+├── speech_tokenizer_v2.onnx
+└── CosyVoice-BlankEN/
+```
+
+RVC 通用资源来自 Hugging Face `lj1995/VoiceConversionWebUI`，目录必须保持：
 
 ```text
 vendor/RVC/assets/
@@ -100,8 +133,8 @@ vendor/RVC/assets/
 └── rmvpe/rmvpe.pt
 ```
 
-资源来自 Hugging Face 仓库 `lj1995/VoiceConversionWebUI`。RVC 音频处理使用
-`imageio-ffmpeg` 自带的 FFmpeg，不要求系统 PATH 中额外安装 `ffmpeg`。
+RVC 音频处理使用 `imageio-ffmpeg` 自带的 FFmpeg，不要求系统 PATH 中额外安装
+`ffmpeg`。
 用户自己的 `.pth` 模型和 `.index` 索引分别放在
 `models/rvc/weights/` 与 `models/rvc/indexes/`。
 

@@ -19,10 +19,10 @@ RUN apt-get update \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt requirements-cosyvoice.txt requirements-docker.txt ./
+COPY requirements.txt ./
 
 RUN python -m pip install --upgrade pip setuptools wheel \
-    && python -m pip install -r requirements-docker.txt
+    && python -m pip install -r requirements.txt
 
 COPY . .
 

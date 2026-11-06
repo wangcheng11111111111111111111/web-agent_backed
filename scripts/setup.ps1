@@ -16,7 +16,6 @@ try {
     docker compose `
         --env-file (Join-Path $Backend ".env") `
         -f (Join-Path $Backend "compose.yaml") `
-        -f (Join-Path $Backend "compose.dev.yaml") `
         up -d postgres redis qdrant
 }
 finally {
@@ -29,7 +28,7 @@ try {
     if (-not (Test-Path -LiteralPath ".venv\Scripts\python.exe")) {
         python -m venv .venv
     }
-    & ".venv\Scripts\python.exe" -m pip install -r requirements-dev.txt
+    & ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 }
 finally {
     Pop-Location
