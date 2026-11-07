@@ -325,7 +325,28 @@ class ChatRepository:
         if self.short_term_memory is not None and role == "assistant":
             cached = await self.short_term_memory.get_message_content(message_id)
             if cached is not None:
-                return cached
+                async with self.database.acquire() as connection:
+                    owned = await connection.fetchval(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM messages m
+                            JOIN sessions s ON s.id = m.session_id
+                            WHERE m.id = $1
+                              AND m.role = $2
+                              AND s.client_id = $3
+                              AND s.tenant_id = $4
+                              AND s.user_id = $5
+                        )
+                        """,
+                        message_id,
+                        role,
+                        client_id,
+                        tenant_id,
+                        user_id,
+                    )
+                if owned:
+                    return cached
         async with self.database.acquire() as connection:
             content = await connection.fetchval(
                 """
@@ -345,6 +366,8 @@ class ChatRepository:
                 user_id,
             )
         if content is None:
+            if self.short_term_memory is not None and role == "assistant":
+                await self.short_term_memory.delete_message_content(message_id)
             return None
         text = str(content)
         if self.short_term_memory is not None and role == "assistant":
@@ -360,6 +383,14 @@ class ChatRepository:
     ) -> bool:
         user_id = user_id or client_id
         async with self.database.acquire() as connection:
+            message_records = await connection.fetch(
+                """
+                SELECT id
+                FROM messages
+                WHERE session_id = $1
+                """,
+                session_id,
+            )
             result = await connection.execute(
                 """
                 DELETE FROM sessions
@@ -374,7 +405,10 @@ class ChatRepository:
                 user_id,
             )
         if result == "DELETE 1" and self.short_term_memory is not None:
-            await self.short_term_memory.delete_session(session_id)
+            await self.short_term_memory.delete_session(
+                session_id,
+                message_ids=[record["id"] for record in message_records],
+            )
         return result == "DELETE 1"
 
     async def recall_recent_messages(
@@ -623,6 +657,37 @@ class MemoryRepository:
                 limit,
             )
         return [MemoryFact(**dict(record)) for record in records]
+
+    async def active_by_ids(
+        self,
+        fact_ids: list[UUID],
+        tenant_id: str,
+        user_id: str,
+    ) -> dict[UUID, MemoryFact]:
+        if not fact_ids:
+            return {}
+        async with self.database.acquire() as connection:
+            records = await connection.fetch(
+                """
+                SELECT id, client_id, fact_type, subject, content, confidence,
+                       source_session_id, created_at, updated_at, content_hash,
+                       importance, access_count, last_accessed_at, expires_at,
+                       deleted_reason, tenant_id, user_id, memory_key
+                FROM user_facts
+                WHERE tenant_id = $1
+                  AND user_id = $2
+                  AND id = ANY($3::uuid[])
+                  AND is_active = TRUE
+                  AND (expires_at IS NULL OR expires_at > NOW())
+                """,
+                tenant_id,
+                user_id,
+                fact_ids,
+            )
+        return {
+            record["id"]: MemoryFact(**dict(record))
+            for record in records
+        }
 
     async def touch(
         self,

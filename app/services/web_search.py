@@ -25,6 +25,10 @@ _DEFAULT_HEADERS = {
 }
 
 
+class WebSearchError(RuntimeError):
+    """User-safe web search failure returned to the agent tool layer."""
+
+
 class WebSearchService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -32,15 +36,16 @@ class WebSearchService:
     async def search(self, query: str) -> list[dict[str, Any]]:
         if not self.settings.web_search_enabled:
             return []
+        provider = self.settings.web_search_provider.strip().lower()
+        if provider == "bing":
+            return await self._search_bing(query)
         api_results = await self._search_api(query)
-        if api_results:
-            logger.info(
-                "Web search provider=%s result_count=%s",
-                self.settings.web_search_provider,
-                len(api_results),
-            )
-            return api_results[: self.settings.web_search_top_k]
-        return await self._search_bing(query)
+        logger.info(
+            "Web search provider=%s result_count=%s",
+            self.settings.web_search_provider,
+            len(api_results),
+        )
+        return api_results[: self.settings.web_search_top_k]
 
     async def _search_bing(self, query: str) -> list[dict[str, Any]]:
         if not self.settings.web_search_enabled:
@@ -119,23 +124,63 @@ class WebSearchService:
     async def _search_api(self, query: str) -> list[dict[str, Any]]:
         provider = self.settings.web_search_provider.strip().lower()
         api_key = self.settings.web_search_api_key.strip()
-        if not provider or provider == "bing" or not api_key:
-            return []
+        if not provider:
+            raise WebSearchError(
+                "联网搜索未配置搜索服务，请设置 WEB_SEARCH_PROVIDER"
+            )
+        if provider not in {"tavily", "serper"}:
+            raise WebSearchError(
+                f"联网搜索配置无效：不支持供应商 {provider}"
+            )
+        if not api_key:
+            raise WebSearchError(
+                f"{self._provider_label(provider)} 联网搜索缺少 API Key"
+            )
         try:
             if provider == "tavily":
                 return await self._tavily(query, api_key)
             if provider == "serper":
                 return await self._serper(query, api_key)
+        except httpx.TimeoutException as exc:
             logger.warning(
-                "Unknown web search provider=%s; falling back to Bing",
+                "Web search provider=%s timed out",
                 provider,
             )
+            raise WebSearchError(
+                f"{self._provider_label(provider)} 联网搜索超时"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            logger.warning(
+                "Web search provider=%s returned HTTP %s",
+                provider,
+                status_code,
+            )
+            raise WebSearchError(
+                f"{self._provider_label(provider)} 联网搜索失败"
+                f"（HTTP {status_code}），请检查 API Key 和额度"
+            ) from exc
         except (httpx.HTTPError, ValueError, TypeError) as exc:
             logger.warning(
-                "Web search API failed; falling back to Bing (%s)",
+                "Web search provider=%s failed (%s)",
+                provider,
                 type(exc).__name__,
             )
-        return []
+            raise WebSearchError(
+                f"{self._provider_label(provider)} 联网搜索失败"
+                f"（{type(exc).__name__}）"
+            ) from exc
+        raise WebSearchError(
+            f"{self._provider_label(provider)} 联网搜索未返回有效响应"
+        )
+
+    @staticmethod
+    def _provider_label(provider: str) -> str:
+        return {
+            "tavily": "Tavily",
+            "serper": "Serper",
+            "bing": "Bing",
+        }.get(provider, provider or "联网搜索")
 
     async def _tavily(
         self,
@@ -225,13 +270,18 @@ class WebSearchService:
     async def search_safe(self, query: str) -> list[dict[str, Any]]:
         try:
             return await self.search(query)
+        except WebSearchError:
+            raise
         except Exception as exc:
             logger.warning(
-                "Web search failed safely (%s: %s)",
+                "Unexpected web search failure (%s)",
                 type(exc).__name__,
-                str(exc),
             )
-            return []
+            provider = self.settings.web_search_provider.strip().lower()
+            raise WebSearchError(
+                f"{self._provider_label(provider)} 联网搜索执行异常"
+                f"（{type(exc).__name__}）"
+            ) from exc
 
     async def _bing(self, query: str) -> list[dict[str, Any]]:
         url = (
@@ -245,7 +295,9 @@ class WebSearchService:
                 r.raise_for_status()
         except httpx.HTTPError as exc:
             logger.warning("Bing request failed: %s", type(exc).__name__)
-            return []
+            raise WebSearchError(
+                f"Bing 联网搜索失败（{type(exc).__name__}）"
+            ) from exc
 
         results: list[dict[str, Any]] = []
         try:
@@ -292,7 +344,9 @@ class WebSearchService:
                 "Bing RSS request/parse failed: %s",
                 type(exc).__name__,
             )
-            return []
+            raise WebSearchError(
+                f"Bing RSS 联网搜索失败（{type(exc).__name__}）"
+            ) from exc
 
         results: list[dict[str, Any]] = []
         for item in root.findall(".//item"):

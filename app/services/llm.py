@@ -33,6 +33,7 @@ class LLMClient:
         tool_context: str,
         long_term_context: str,
         conversation_context: str,
+        execution_plan: str = "",
     ) -> list[dict[str, str]]:
         if self._prompt_store is not None:
             system = await self._prompt_store.get_full_system_prompt()
@@ -42,7 +43,12 @@ class LLMClient:
         if knowledge_context:
             system += "\n\n知识库片段：\n" + knowledge_context
         if tool_context:
-            system += "\n\n工具执行结果：\n" + tool_context
+            system += (
+                "\n\n【本轮工具执行结果，优先级高于对话历史】\n"
+                "以下内容由本轮工具刚刚获取。历史回答中的失败、无结果或"
+                "“无法确认”结论不能覆盖这些成功结果：\n"
+                + tool_context
+            )
         if long_term_context:
             system += "\n\n用户长期记忆：\n" + long_term_context
         if conversation_context:
@@ -50,6 +56,12 @@ class LLMClient:
                 "\n\n往期会话参考（这些是历史对话原文，不是长期事实；"
                 "只在相关时参考，若与当前消息冲突以当前消息为准）：\n"
                 + conversation_context
+            )
+        if execution_plan:
+            system += (
+                "\n\n当前任务的执行计划（请按顺序完成，并在最终回答中"
+                "覆盖已经完成的步骤；失败步骤要如实说明）：\n"
+                + execution_plan
             )
         messages = [{"role": "system", "content": system}]
         for item in history[-20:]:
@@ -69,6 +81,7 @@ class LLMClient:
         tool_context: str = "",
         long_term_context: str = "",
         conversation_context: str = "",
+        execution_plan: str = "",
     ) -> AsyncIterator[str]:
         if not self.settings.model_configured:
             raise ModelConfigError()
@@ -82,6 +95,7 @@ class LLMClient:
                 tool_context,
                 long_term_context,
                 conversation_context,
+                execution_plan,
             ),
             "stream": True,
             "temperature": 0.3,
@@ -139,10 +153,22 @@ class LLMClient:
         message: str,
         history: list[dict[str, str]],
         tools: list[dict[str, object]],
+        plan: list[dict[str, object]] | None = None,
     ) -> list[dict[str, object]]:
         """Ask the chat model which available tools should handle this turn."""
         if not self.settings.model_configured or not tools:
             return []
+        plan_context = ""
+        if plan:
+            plan_context = "\n".join(
+                f"{index}. {item.get('title', '')}"
+                + (
+                    f"（工具：{item['tool']}）"
+                    if item.get("tool")
+                    else ""
+                )
+                for index, item in enumerate(plan, start=1)
+            )
         payload = {
             "model": self.settings.llm_model,
             "messages": await self._messages(
@@ -152,6 +178,7 @@ class LLMClient:
                 "",
                 "",
                 "",
+                plan_context,
             ),
             "tools": tools,
             "tool_choice": "auto",
@@ -215,6 +242,101 @@ class LLMClient:
         except (httpx.HTTPError, ValueError, TypeError) as exc:
             logger.warning(
                 "LLM tool selection failed safely (%s)",
+                type(exc).__name__,
+            )
+            return []
+
+    async def create_plan(
+        self,
+        *,
+        message: str,
+        history: list[dict[str, str]],
+        available_tools: list[str],
+    ) -> list[dict[str, str]]:
+        """Create a small, ordered execution plan before any tool runs."""
+        if not self.settings.model_configured:
+            return []
+        tool_text = "、".join(available_tools) if available_tools else "无外部工具"
+        system = (
+            "你是任务规划器。先识别用户真正要完成的目标、约束和依赖，"
+            "再拆成 2 到 6 个可独立检查的步骤。简单问题也应包含"
+            "“理解需求”“组织答案”等必要步骤，但不要为了凑数拆分。"
+            "只有当某个步骤确实需要外部能力时，才填写 tool；"
+            f"可用工具仅限：{tool_text}。"
+            "最后一步必须负责整合所有结果并核对是否回答了原问题。"
+            "只返回严格 JSON，不要 Markdown，格式为："
+            '{"steps":[{"title":"步骤说明","tool":"工具名或空字符串"}]}。'
+        )
+        history_messages = [
+            {
+                "role": item.get("role", "user"),
+                "content": item.get("content", ""),
+            }
+            for item in history[-8:]
+            if item.get("role") in {"user", "assistant"} and item.get("content")
+        ]
+        headers = {
+            "Authorization": f"Bearer {self.settings.llm_api_key}",
+            "Content-Type": "application/json",
+        }
+        timeout = httpx.Timeout(
+            self.settings.llm_timeout,
+            connect=min(15.0, self.settings.llm_timeout),
+        )
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    f"{self.settings.llm_base_url}/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": self.settings.llm_model,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            *history_messages,
+                            {"role": "user", "content": message},
+                        ],
+                        "temperature": 0,
+                        "stream": False,
+                    },
+                )
+            if response.status_code >= 400:
+                logger.warning(
+                    "LLM planner returned HTTP %s",
+                    response.status_code,
+                )
+                return []
+            payload = response.json()
+            content = (
+                ((payload.get("choices") or [{}])[0].get("message") or {})
+                .get("content", "")
+            )
+            if not isinstance(content, str) or not content.strip():
+                return []
+            content = content.strip()
+            if content.startswith("```"):
+                content = content.strip("`")
+                if content.lower().startswith("json"):
+                    content = content[4:].lstrip()
+            parsed = json.loads(content)
+            raw_steps = parsed.get("steps", [])
+            if not isinstance(raw_steps, list):
+                return []
+            steps: list[dict[str, str]] = []
+            for item in raw_steps[:6]:
+                if isinstance(item, str):
+                    title = item.strip()
+                    tool = ""
+                elif isinstance(item, dict):
+                    title = str(item.get("title", "")).strip()
+                    tool = str(item.get("tool", "") or "").strip()
+                else:
+                    continue
+                if title:
+                    steps.append({"title": title, "tool": tool})
+            return steps
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            logger.warning(
+                "LLM planning failed safely (%s)",
                 type(exc).__name__,
             )
             return []

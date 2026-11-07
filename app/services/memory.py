@@ -437,6 +437,19 @@ class LongTermMemory:
                 vector=vector,
                 limit=max(self.settings.memory_top_k * 2, self.settings.memory_top_k),
             )
+            result_ids: list[UUID] = []
+            for item in results:
+                payload = item.get("payload") or {}
+                raw_id = payload.get("fact_id", item.get("id"))
+                try:
+                    result_ids.append(UUID(str(raw_id)))
+                except (TypeError, ValueError):
+                    continue
+            active_facts = await self.repository.active_by_ids(
+                result_ids,
+                tenant_id,
+                user_id,
+            )
             now = datetime.now(timezone.utc)
             recency_days = max(self.settings.memory_recency_days, 1)
             for item in results:
@@ -444,21 +457,18 @@ class LongTermMemory:
                 if similarity < self.settings.memory_retrieval_threshold:
                     continue
                 payload = item.get("payload") or {}
-                expires_at = payload.get("expires_at")
-                if expires_at:
-                    try:
-                        expires = datetime.fromisoformat(str(expires_at))
-                        if expires.tzinfo is None:
-                            expires = expires.replace(tzinfo=timezone.utc)
-                        if expires <= now:
-                            continue
-                    except ValueError:
-                        pass
-                confidence = float(payload.get("confidence", 0.5))
-                importance = float(payload.get("importance", 0.5))
-                updated_at = payload.get("updated_at")
+                raw_id = payload.get("fact_id", item.get("id"))
                 try:
-                    updated = datetime.fromisoformat(str(updated_at))
+                    fact_id = UUID(str(raw_id))
+                except (TypeError, ValueError):
+                    continue
+                fact = active_facts.get(fact_id)
+                if fact is None:
+                    continue
+                confidence = fact.confidence
+                importance = fact.importance
+                try:
+                    updated = fact.updated_at
                     if updated.tzinfo is None:
                         updated = updated.replace(tzinfo=timezone.utc)
                     age_days = max(
@@ -477,11 +487,11 @@ class LongTermMemory:
                 )
                 active.append(
                     {
-                        "fact_id": str(payload.get("fact_id", item.get("id", ""))),
-                        "fact_type": str(payload.get("fact_type", "profile")),
-                        "memory_key": str(payload.get("memory_key", "")),
-                        "subject": str(payload.get("subject", "用户")),
-                        "content": str(payload.get("content", "")),
+                        "fact_id": str(fact.id),
+                        "fact_type": fact.fact_type,
+                        "memory_key": fact.memory_key,
+                        "subject": fact.subject,
+                        "content": fact.content,
                         "score": round(final_score, 4),
                         "similarity": round(similarity, 4),
                         "importance": round(importance, 4),
@@ -510,27 +520,6 @@ class LongTermMemory:
             logger.warning(
                 "Long-term memory retrieval failed safely (%s)",
                 type(exc).__name__,
-            )
-
-        try:
-            recent_deleted = await self.repository.list_recent_deleted(
-                client_id=user_id,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                limit=5,
-            )
-            for fact in recent_deleted:
-                deleted.append(
-                    {
-                        "fact_id": str(fact.id),
-                        "fact_type": fact.fact_type,
-                        "subject": fact.subject,
-                        "content": fact.content,
-                    }
-                )
-        except Exception as exc:
-            logger.warning(
-                "Deleted memory lookup failed safely (%s)", type(exc).__name__
             )
 
         logger.info(
@@ -726,20 +715,22 @@ class LongTermMemory:
         user_id: str,
         fact_id: UUID,
     ) -> bool:
-        try:
-            await self.vectors.soft_delete(fact_id)
-        except Exception as exc:
-            logger.warning(
-                "Memory vector soft_delete failed; PostgreSQL record not changed (%s)",
-                type(exc).__name__,
-            )
-            return False
-        return await self.repository.soft_delete(
+        deleted = await self.repository.soft_delete(
             fact_id=fact_id,
             client_id=user_id,
             tenant_id=tenant_id,
             user_id=user_id,
         )
+        if not deleted:
+            return False
+        try:
+            await self.vectors.soft_delete(fact_id)
+        except Exception as exc:
+            logger.warning(
+                "Memory vector cleanup deferred; PostgreSQL deletion is authoritative (%s)",
+                type(exc).__name__,
+            )
+        return True
 
 
 def format_memory_context(

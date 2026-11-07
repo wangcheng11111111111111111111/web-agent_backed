@@ -15,7 +15,7 @@ workspace/
 主要能力：
 
 - OpenAI 兼容流式聊天。
-- LangGraph 记忆加载、模型自主工具选择和工具执行。
+- LangGraph 任务拆解、记忆加载、模型自主工具选择和逐步执行。
 - PostgreSQL 保存会话、消息、文档和长期事实。
 - Redis 缓存最近会话及按消息 ID 查询的 TTS 正文。
 - Qdrant 保存知识库和长期记忆向量。
@@ -45,7 +45,7 @@ Browser / Vue + Web Audio
 
 FastAPI
   ├── LangGraph
-  │   └── select_tools -> load_memory -> execute_tools -> answer
+  │   └── plan_task -> select_tools -> load_memory -> execute_tools -> answer
   ├── PostgreSQL
   │   └── sessions/messages/documents/user_facts/settings
   ├── Redis
@@ -69,28 +69,42 @@ FastAPI
 
 1. 前端调用 `POST /api/chat/stream`。
 2. 后端创建或校验会话并写入用户消息。
-3. 对话模型通过原生 `tools/tool_calls` 自主选择时间、知识库、Bing
-   搜索或网页抓取工具。
-4. LangGraph 先加载长期记忆，再执行模型选择的工具。
-5. SSE 持续返回状态和增量文本。
-6. 完成后助手消息写入 PostgreSQL。
-7. 完成事件返回真实数据库消息 UUID。
-8. 前端替换临时 `local-assistant-*` ID。
-9. 后台异步提取长期记忆。
+3. 规划模型先把任务拆成 2-6 个可检查步骤，并通过 SSE 返回执行计划。
+4. 对话模型结合计划，通过原生 `tools/tool_calls` 自主选择时间、
+   知识库、联网搜索或网页抓取工具。
+5. LangGraph 先加载长期记忆，再按计划逐步执行工具；单个工具异常会被
+   隔离，其余步骤继续执行，最终回答必须说明失败环节及其影响。
+6. SSE 持续返回计划进度、状态和增量文本。
+7. 完成后助手消息写入 PostgreSQL。
+8. 完成事件返回真实数据库消息 UUID。
+9. 前端替换临时 `local-assistant-*` ID。
+10. 后台异步提取长期记忆。
+
+会话隔离规则：
+
+- 新会话不会自动携带其他会话的原文，只加载与当前问题相关的长期事实。
+- 只有用户明确询问“之前、上次、继续、记得”时，才允许跨会话召回历史原文。
+- 删除会话会删除 PostgreSQL 消息，并按消息 ID 清理 Redis 会话、元数据和
+  TTS 正文缓存；缓存读取始终先校验消息仍属于当前用户。
+- 用户删除长期记忆时使用逻辑删除：PostgreSQL 标记失效并清理 Qdrant
+  向量。Qdrant 清理为尽力执行；即使暂时失败，数据库已无对应有效记录，
+  残留向量也会被过滤，不能再次进入提示词。
 
 模型工具调用使用 OpenAI 兼容 `tools/tool_calls`。可用工具包括当前时间、
 安全算术计算、本地知识库检索、知识库文档列表、长期记忆列表、历史会话
 检索、网页抓取和联网搜索。可将 `WEB_SEARCH_PROVIDER` 设为 `tavily`
-或 `serper` 并填写 `WEB_SEARCH_API_KEY`；未配置 Key、留空 Provider 或
-API 调用失败时使用 Bing。模型为 `web_search` 生成包含对象、年份和日期
-的查询词；后端自动补充当天日期，解析 Bing HTML/RSS 并抓取搜索结果正文。
+或 `serper` 并填写 `WEB_SEARCH_API_KEY`；只有显式设置为 `bing` 时才
+使用 Bing，不会在 Tavily/Serper 失败时自动降级。模型为 `web_search`
+生成包含对象、年份和日期的查询词；后端自动补充当天日期并抓取搜索结果正文。
+搜索服务失败会作为工具异常返回，Agent 会标记该步骤失败、继续可完成的回答，
+并在最终回复中告知用户。
 CS2/CSGO 查询会自动识别今天、昨天、明天及显式日期，追加 HLTV 和
 Liquipedia 站内查询，并优先抓取 HLTV 对应日期的结果页。
 如果搜索结果页直连返回 403、反爬挑战或没有正文，后端会通过
 `r.jina.ai` 纯文本阅读器再次读取页面；该兜底会把目标 URL 发送给第三方
 阅读服务，不包含用户聊天正文或密钥。
 如果模型漏选工具但问题明显属于今天、最新、比赛、新闻、天气、股价等
-实时信息，后端会在联网开启时强制补调 Bing；联网关闭时会向回答上下文
+实时信息，后端会在联网开启时强制补调搜索工具；联网关闭时会向回答上下文
 明确说明无法获取实时数据。前端会记住最近一次联网开关状态。
 
 ### 4.2 TTS 取文
@@ -125,11 +139,11 @@ message_id
 
 ### 4.3 分段策略
 
-- 不同段落不合并。
+- 按完整句子和自然段聚合，短句、短段落会合并，避免 CosyVoice 收到
+  单字或只有标点的请求。
 - 单句最多约 64 字。
-- 首段目标最多 120 字。
-- 第二段最多 `min(80, 首段实际字数 - 1)`。
-- 后续每段必须严格小于前一段的实际字数。
+- 每个合成片段目标最多 120 字。
+- 小于约 12 个有效字符的片段会与相邻片段合并。
 - 只有单个句子放不下时才在标点附近拆分。
 - 不增加段间静音。
 - 前端按上一段结束时间调度下一段。
@@ -427,6 +441,7 @@ Redis 不可用时回源 PostgreSQL；按消息 ID 查询成功后回填 Redis�
 
 ```powershell
 .\.venv\Scripts\python.exe -B -c "from pathlib import Path; [compile(p.read_text(encoding='utf-8-sig'), str(p), 'exec') for p in Path('app').rglob('*.py')]"
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
 ```
 
 前端：

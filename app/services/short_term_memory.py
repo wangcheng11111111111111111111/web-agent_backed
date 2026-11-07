@@ -214,23 +214,43 @@ class ShortTermMemory:
             self._mark_failure(exc)
             return False
 
-    async def delete_session(self, session_id: UUID) -> None:
+    async def delete_session(
+        self,
+        session_id: UUID,
+        *,
+        message_ids: list[UUID] | None = None,
+    ) -> None:
         if not await self.connect():
             return
         assert self.client is not None
         try:
             messages_key = self._messages_key(session_id)
             raw_messages = await self.client.lrange(messages_key, 0, -1)
-            pipe = self.client.pipeline(transaction=True)
-            pipe.delete(messages_key, self._meta_key(session_id))
+            cached_message_ids: set[str] = set()
             for raw in raw_messages:
                 try:
                     message_id = json.loads(raw).get("id")
                 except (json.JSONDecodeError, AttributeError):
                     message_id = None
                 if message_id:
-                    pipe.delete(self._message_content_key(str(message_id)))
+                    cached_message_ids.add(str(message_id))
+            cached_message_ids.update(
+                str(message_id) for message_id in (message_ids or [])
+            )
+            pipe = self.client.pipeline(transaction=True)
+            pipe.delete(messages_key, self._meta_key(session_id))
+            for message_id in cached_message_ids:
+                pipe.delete(self._message_content_key(str(message_id)))
             await pipe.execute()
+        except Exception as exc:
+            self._mark_failure(exc)
+
+    async def delete_message_content(self, message_id: UUID | str) -> None:
+        if not await self.connect():
+            return
+        assert self.client is not None
+        try:
+            await self.client.delete(self._message_content_key(message_id))
         except Exception as exc:
             self._mark_failure(exc)
 

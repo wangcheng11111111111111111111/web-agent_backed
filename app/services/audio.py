@@ -20,6 +20,7 @@ from app.services.voice_prompts import VoicePromptStore
 logger = logging.getLogger(__name__)
 
 MAX_TTS_CHARS = 20000
+MIN_TTS_SPOKEN_CHARS = 12
 _EDGE_VOICE = "zh-CN-XiaoxiaoNeural"
 
 EDGE_CN_VOICES: dict[str, str] = {
@@ -211,7 +212,10 @@ def _group_sentence_segments(
         limit = (
             first_maximum_chars
             if previous is None
-            else min(subsequent_start_chars, max(1, previous - 1))
+            else min(
+                subsequent_start_chars,
+                max(MIN_TTS_SPOKEN_CHARS, previous - 1),
+            )
         )
         content = ""
         while pending:
@@ -238,8 +242,32 @@ def _group_sentence_segments(
     return grouped
 
 
+def _spoken_char_count(text: str) -> int:
+    return len(re.findall(r"[\u3400-\u9fffA-Za-z0-9]", text))
+
+
+def _merge_short_tts_segments(segments: list[str]) -> list[str]:
+    """Avoid unsafe one-character CosyVoice requests by merging short pieces."""
+    merged: list[str] = []
+    pending = ""
+    for segment in segments:
+        segment = segment.strip()
+        if not segment:
+            continue
+        pending += segment
+        if _spoken_char_count(pending) >= MIN_TTS_SPOKEN_CHARS:
+            merged.append(pending)
+            pending = ""
+    if pending:
+        if merged and _spoken_char_count(pending) < MIN_TTS_SPOKEN_CHARS:
+            merged[-1] += pending
+        else:
+            merged.append(pending)
+    return merged or [""]
+
+
 def _group_tts_paragraphs(text: str) -> list[str]:
-    """Group each paragraph separately so tone and emphasis do not cross blocks."""
+    """Group sentences into stable, speakable blocks."""
     paragraphs = [
         paragraph.strip()
         for paragraph in re.split(r"\n\s*\n+", text)
@@ -250,10 +278,9 @@ def _group_tts_paragraphs(text: str) -> list[str]:
         sentences = _split_tts_sentences(paragraph)
         paragraph_groups = _group_sentence_segments(
             sentences,
-            previous_chars=len(grouped[-1]) if grouped else None,
         )
         grouped.extend(paragraph_groups)
-    return grouped or [text.strip()]
+    return _merge_short_tts_segments(grouped) or [text.strip()]
 
 
 def _normalize_spoken_text(text: str) -> str:

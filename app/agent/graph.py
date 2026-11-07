@@ -20,7 +20,7 @@ from app.services.llm import LLMClient
 from app.services.memory import LongTermMemory, format_memory_context
 from app.services.crawler import WebCrawlerService
 from app.services.rag import RagService
-from app.services.web_search import WebSearchService
+from app.services.web_search import WebSearchError, WebSearchService
 from app.storage.repositories import DocumentRepository, MemoryRepository
 
 logger = logging.getLogger(__name__)
@@ -80,6 +80,8 @@ class AgentState(TypedDict, total=False):
     memories: list[dict[str, Any]]
     deleted_memories: list[dict[str, Any]]
     recalled_messages: list[dict[str, Any]]
+    execution_plan: list[dict[str, Any]]
+    plan_error: str
     rag_error: str
     answer: str
     error: str
@@ -119,16 +121,118 @@ class AssistantGraph:
         self.document_repository = document_repository
         self.memory_repository = memory_repository
         graph = StateGraph(AgentState)
+        graph.add_node("plan_task", self._plan_task)
         graph.add_node("select_tools", self._select_tools)
         graph.add_node("load_memory", self._load_memory)
         graph.add_node("execute_tools", self._execute_tools)
         graph.add_node("answer", self._answer)
-        graph.add_edge(START, "select_tools")
+        graph.add_edge(START, "plan_task")
+        graph.add_edge("plan_task", "select_tools")
         graph.add_edge("select_tools", "load_memory")
         graph.add_edge("load_memory", "execute_tools")
         graph.add_edge("execute_tools", "answer")
         graph.add_edge("answer", END)
         self.graph = graph.compile()
+
+    async def _plan_task(
+        self, state: AgentState, config: RunnableConfig
+    ) -> dict[str, Any]:
+        emit = _emit_from_config(config)
+        available_names = [
+            str(item.get("function", {}).get("name", ""))
+            for item in self._available_tools(state)
+        ]
+        await emit(
+            {
+                "type": "status",
+                "stage": "plan_task",
+                "message": "正在拆解任务并安排执行步骤",
+            }
+        )
+        plan_error = ""
+        source = "model"
+        try:
+            raw_steps = await self.llm.create_plan(
+                message=state["question"],
+                history=state.get("history", []),
+                available_tools=available_names,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Agent planning failed; using safe fallback")
+            raw_steps = []
+            plan_error = f"任务规划器暂时不可用（{type(exc).__name__}）"
+
+        normalized: list[dict[str, Any]] = []
+        for item in raw_steps[:6]:
+            title = (
+                str(item.get("title", "")).strip()
+                if isinstance(item, dict)
+                else str(item).strip()
+            )
+            requested_tool = (
+                str(item.get("tool", "") or "").strip()
+                if isinstance(item, dict)
+                else ""
+            )
+            if not title:
+                continue
+            normalized.append(
+                {
+                    "id": f"step-{len(normalized) + 1}",
+                    "title": title[:160],
+                    "tool": (
+                        requested_tool
+                        if requested_tool in available_names
+                        else ""
+                    ),
+                    "status": "pending",
+                }
+            )
+        if not normalized:
+            source = "fallback"
+            normalized = [
+                {
+                    "id": "step-1",
+                    "title": "理解问题、目标和约束",
+                    "tool": "",
+                    "status": "pending",
+                },
+                {
+                    "id": "step-2",
+                    "title": "收集所需信息并执行必要工具",
+                    "tool": "",
+                    "status": "pending",
+                },
+                {
+                    "id": "step-3",
+                    "title": "核对结果并组织完整回答",
+                    "tool": "",
+                    "status": "pending",
+                },
+            ]
+        logger.info(
+            "Agent plan source=%s steps=%s",
+            source,
+            [item["title"] for item in normalized],
+        )
+        await emit(
+            {
+                "type": "plan",
+                "steps": normalized,
+                "source": source,
+                "message": (
+                    plan_error
+                    if plan_error
+                    else f"已拆解为 {len(normalized)} 个步骤"
+                ),
+            }
+        )
+        return {
+            "execution_plan": normalized,
+            "plan_error": plan_error,
+        }
 
     async def _select_tools(
         self, state: AgentState, config: RunnableConfig
@@ -149,6 +253,7 @@ class AssistantGraph:
             message=state["question"],
             history=state.get("history", []),
             tools=tools,
+            plan=state.get("execution_plan", []),
         )
         selection_error = ""
         if not selected and self._looks_realtime(state["question"]):
@@ -177,7 +282,7 @@ class AssistantGraph:
                 ]
             else:
                 selection_error = (
-                    "实时信息工具未调用：本次请求没有启用 Bing 联网搜索，"
+                    "实时信息工具未调用：本次请求没有启用联网搜索，"
                     "且问题中没有可抓取的 URL。请开启前端的联网开关后重试。"
                 )
         names = [str(item.get("name", "")) for item in selected]
@@ -203,9 +308,9 @@ class AssistantGraph:
     def _looks_realtime(question: str) -> bool:
         return bool(
             re.search(
-                r"(今天|今日|现在|最新|实时|当前|刚刚|本周|比赛|赛程|"
+                r"(今天|今日|现在|最新|最近|实时|当前|刚刚|本周|比赛|赛程|"
                 r"新闻|天气|股价|汇率|比分|today|latest|current|"
-                r"news|schedule|price|score)",
+                r"recent|news|schedule|price|score)",
                 question,
                 re.IGNORECASE,
             )
@@ -340,7 +445,7 @@ class AssistantGraph:
                     "function": {
                         "name": "web_search",
                         "description": (
-                            "通过 Bing 搜索最新公开信息。用户开启联网并"
+                            "通过已配置的联网搜索服务查找最新公开信息。用户开启联网并"
                             "需要新闻、实时信息或外部资料时调用。query "
                             "应包含对象、地点、年份和日期，必要时加入英文关键词。"
                             f"当前日期是 {today}，用户说今天、昨天或明天时必须"
@@ -351,7 +456,7 @@ class AssistantGraph:
                             "properties": {
                                 "query": {
                                     "type": "string",
-                                    "description": "优化后的 Bing 搜索词",
+                                    "description": "优化后的联网搜索词",
                                 }
                             },
                             "required": ["query"],
@@ -386,7 +491,7 @@ class AssistantGraph:
         if (
             self.conversation_recall is not None
             and state.get("session_id")
-            and (not active or wants_history)
+            and wants_history
         ):
             recalled = await self.conversation_recall.recall_safe(
                 client_id=state.get("client_id", "default"),
@@ -430,11 +535,51 @@ class AssistantGraph:
     ) -> dict[str, Any]:
         emit = _emit_from_config(config)
         selected = state.get("tool_calls", [])[:8]
+        plan = [
+            dict(item)
+            for item in state.get("execution_plan", [])
+            if isinstance(item, dict)
+        ]
         tool_parts: list[str] = []
         tool_errors: list[str] = []
         sources: list[dict[str, Any]] = []
         web_results: list[dict[str, Any]] = []
         executed: set[tuple[str, str]] = set()
+
+        async def update_plan_step(
+            index: int,
+            status: str,
+            message: str,
+        ) -> None:
+            if index < 0 or index >= len(plan):
+                return
+            plan[index]["status"] = status
+            await emit(
+                {
+                    "type": "plan_step",
+                    "step_id": plan[index].get("id", f"step-{index + 1}"),
+                    "status": status,
+                    "message": message,
+                    "execution_plan": plan,
+                }
+            )
+
+        first_tool_index = next(
+            (
+                index
+                for index, item in enumerate(plan)
+                if item.get("tool") and item.get("status") == "pending"
+            ),
+            len(plan),
+        )
+        pre_answer_end = min(first_tool_index, max(0, len(plan) - 1))
+        for index in range(pre_answer_end):
+            if plan[index].get("status") == "pending":
+                await update_plan_step(
+                    index,
+                    "completed",
+                    str(plan[index].get("title", "")),
+                )
 
         for call in selected:
             name = str(call.get("name", "")).strip()
@@ -449,128 +594,172 @@ class AssistantGraph:
                 continue
             executed.add(execution_key)
             logger.info("Agent executing model-selected tool=%s", name)
-            update: dict[str, Any]
-            if name == "get_current_time":
-                update = await self._time_tool(state, config)
-            elif name == "search_knowledge_base":
-                update = await self._retrieve(state, config)
-                count = len(update.get("sources", []))
-                tool_parts.append(f"知识库检索返回 {count} 条片段。")
-            elif name == "web_search":
-                query = (
-                    str(arguments.get("query", "")).strip()
-                    if isinstance(arguments, dict)
-                    else ""
+            plan_index = next(
+                (
+                    index
+                    for index, item in enumerate(plan)
+                    if item.get("tool") == name
+                    and item.get("status") == "pending"
+                ),
+                -1,
+            )
+            if plan_index >= 0:
+                await update_plan_step(
+                    plan_index,
+                    "running",
+                    f"正在执行：{plan[plan_index].get('title', name)}",
                 )
-                update = await self._web_search_node(
-                    state,
-                    config,
-                    query=query or state["question"],
-                )
-                results = update.get("web_results", [])
-                web_results.extend(results)
-                tool_parts.append(f"Bing 联网搜索返回 {len(results)} 条结果。")
-            elif name == "fetch_web_page":
-                update = await self._crawl(state, config)
-            elif name == "calculate":
-                try:
-                    expression = str(arguments.get("expression", "")).strip()
-                    value = _safe_calculate(expression)
-                    update = {
-                        "tool_result": f"{expression} = {value:g}",
-                    }
-                except (SyntaxError, TypeError, ValueError, ZeroDivisionError) as exc:
-                    update = {
-                        "tool_error": f"计算失败：{exc}",
-                    }
-            elif name == "list_knowledge_documents":
-                if self.document_repository is None:
-                    update = {"tool_error": "知识库文档工具不可用"}
-                else:
-                    try:
-                        documents = await self.document_repository.list()
-                        lines = [
-                            (
-                                f"- {doc.filename}: {doc.size_bytes} bytes, "
-                                f"{doc.chunk_count} chunks"
-                            )
-                            for doc in documents
-                        ]
-                        update = {
-                            "tool_result": (
-                                "知识库文档：\n" + "\n".join(lines)
-                                if lines
-                                else "知识库中暂无文档。"
-                            )
-                        }
-                    except Exception as exc:
-                        update = {
-                            "tool_error": (
-                                f"知识库文档列表读取失败：{type(exc).__name__}"
-                            )
-                        }
-            elif name == "list_long_term_memories":
-                if self.memory_repository is None:
-                    update = {"tool_error": "长期记忆工具不可用"}
-                else:
-                    try:
-                        memories = await self.memory_repository.list_active(
-                            state.get("client_id", "default"),
-                            state.get("tenant_id", "default"),
-                            state.get("user_id", state.get("client_id", "default")),
-                        )
-                        lines = [
-                            f"- [{fact.fact_type}] {fact.content}"
-                            for fact in memories
-                        ]
-                        update = {
-                            "tool_result": (
-                                "长期记忆：\n" + "\n".join(lines)
-                                if lines
-                                else "当前没有长期记忆。"
-                            )
-                        }
-                    except Exception as exc:
-                        update = {
-                            "tool_error": (
-                                f"长期记忆读取失败：{type(exc).__name__}"
-                            )
-                        }
-            elif name == "search_conversation_history":
-                if self.conversation_recall is None:
-                    update = {"tool_error": "历史会话检索不可用"}
-                elif not state.get("session_id"):
-                    update = {"tool_error": "当前会话 ID 缺失，无法检索历史"}
-                else:
-                    query = str(arguments.get("query", "")).strip()
-                    recalled = await self.conversation_recall.recall_safe(
-                        client_id=state.get("client_id", "default"),
-                        tenant_id=state.get("tenant_id", "default"),
-                        user_id=state.get(
-                            "user_id",
-                            state.get("client_id", "default"),
-                        ),
-                        current_session_id=UUID(state["session_id"]),
+            try:
+                update: dict[str, Any]
+                if name == "get_current_time":
+                    update = await self._time_tool(state, config)
+                elif name == "search_knowledge_base":
+                    update = await self._retrieve(state, config)
+                    count = len(update.get("sources", []))
+                    tool_parts.append(f"知识库检索返回 {count} 条片段。")
+                elif name == "web_search":
+                    query = (
+                        str(arguments.get("query", "")).strip()
+                        if isinstance(arguments, dict)
+                        else ""
+                    )
+                    update = await self._web_search_node(
+                        state,
+                        config,
                         query=query or state["question"],
                     )
-                    lines = [
-                        (
-                            f"- {item.get('session_title', '未命名')} "
-                            f"[{item.get('role', 'user')}]: "
-                            f"{item.get('content', '')[:500]}"
+                    results = update.get("web_results", [])
+                    web_results.extend(results)
+                    if not update.get("tool_error"):
+                        tool_parts.append(
+                            f"联网搜索返回 {len(results)} 条结果。"
                         )
-                        for item in recalled
-                    ]
+                elif name == "fetch_web_page":
+                    update = await self._crawl(state, config)
+                elif name == "calculate":
+                    try:
+                        expression = str(arguments.get("expression", "")).strip()
+                        value = _safe_calculate(expression)
+                        update = {
+                            "tool_result": f"{expression} = {value:g}",
+                        }
+                    except (
+                        SyntaxError,
+                        TypeError,
+                        ValueError,
+                        ZeroDivisionError,
+                    ) as exc:
+                        update = {
+                            "tool_error": f"计算失败：{exc}",
+                        }
+                elif name == "list_knowledge_documents":
+                    if self.document_repository is None:
+                        update = {"tool_error": "知识库文档工具不可用"}
+                    else:
+                        try:
+                            documents = await self.document_repository.list()
+                            lines = [
+                                (
+                                    f"- {doc.filename}: {doc.size_bytes} bytes, "
+                                    f"{doc.chunk_count} chunks"
+                                )
+                                for doc in documents
+                            ]
+                            update = {
+                                "tool_result": (
+                                    "知识库文档：\n" + "\n".join(lines)
+                                    if lines
+                                    else "知识库中暂无文档。"
+                                )
+                            }
+                        except Exception as exc:
+                            update = {
+                                "tool_error": (
+                                    "知识库文档列表读取失败："
+                                    f"{type(exc).__name__}"
+                                )
+                            }
+                elif name == "list_long_term_memories":
+                    if self.memory_repository is None:
+                        update = {"tool_error": "长期记忆工具不可用"}
+                    else:
+                        try:
+                            memories = await self.memory_repository.list_active(
+                                state.get("client_id", "default"),
+                                state.get("tenant_id", "default"),
+                                state.get(
+                                    "user_id",
+                                    state.get("client_id", "default"),
+                                ),
+                            )
+                            lines = [
+                                f"- [{fact.fact_type}] {fact.content}"
+                                for fact in memories
+                            ]
+                            update = {
+                                "tool_result": (
+                                    "长期记忆：\n" + "\n".join(lines)
+                                    if lines
+                                    else "当前没有长期记忆。"
+                                )
+                            }
+                        except Exception as exc:
+                            update = {
+                                "tool_error": (
+                                    "长期记忆读取失败："
+                                    f"{type(exc).__name__}"
+                                )
+                            }
+                elif name == "search_conversation_history":
+                    if self.conversation_recall is None:
+                        update = {"tool_error": "历史会话检索不可用"}
+                    elif not state.get("session_id"):
+                        update = {
+                            "tool_error": "当前会话 ID 缺失，无法检索历史"
+                        }
+                    else:
+                        query = str(arguments.get("query", "")).strip()
+                        recalled = await self.conversation_recall.recall_safe(
+                            client_id=state.get("client_id", "default"),
+                            tenant_id=state.get("tenant_id", "default"),
+                            user_id=state.get(
+                                "user_id",
+                                state.get("client_id", "default"),
+                            ),
+                            current_session_id=UUID(state["session_id"]),
+                            query=query or state["question"],
+                        )
+                        lines = [
+                            (
+                                f"- {item.get('session_title', '未命名')} "
+                                f"[{item.get('role', 'user')}]: "
+                                f"{item.get('content', '')[:500]}"
+                            )
+                            for item in recalled
+                        ]
+                        update = {
+                            "tool_result": (
+                                "相关历史会话：\n" + "\n".join(lines)
+                                if lines
+                                else "未找到相关历史会话。"
+                            )
+                        }
+                else:
                     update = {
-                        "tool_result": (
-                            "相关历史会话：\n" + "\n".join(lines)
-                            if lines
-                            else "未找到相关历史会话。"
-                        )
+                        "tool_error": f"模型请求了不支持的工具：{name}",
                     }
-            else:
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "Agent tool=%s raised an unexpected exception",
+                    name,
+                )
                 update = {
-                    "tool_error": f"模型请求了不支持的工具：{name}",
+                    "tool_error": (
+                        f"{self._tool_label(name)}执行异常"
+                        f"（{type(exc).__name__}），已跳过该步骤并继续回答。"
+                    ),
                 }
 
             if update.get("tool_result"):
@@ -580,6 +769,36 @@ class AssistantGraph:
             sources.extend(update.get("sources", []))
             if name != "web_search":
                 web_results.extend(update.get("web_results", []))
+            if plan_index >= 0:
+                await update_plan_step(
+                    plan_index,
+                    "failed" if update.get("tool_error") else "completed",
+                    (
+                        str(update.get("tool_error", ""))
+                        if update.get("tool_error")
+                        else f"已完成：{plan[plan_index].get('title', name)}"
+                    ),
+                )
+
+        for index, item in enumerate(plan):
+            if (
+                item.get("tool")
+                and item.get("status") == "pending"
+                and index != len(plan) - 1
+            ):
+                await update_plan_step(
+                    index,
+                    "skipped",
+                    f"未需要执行：{item.get('title', item.get('tool', ''))}",
+                )
+
+        for index, item in enumerate(plan[:-1]):
+            if not item.get("tool") and item.get("status") == "pending":
+                await update_plan_step(
+                    index,
+                    "completed",
+                    str(item.get("title", "")),
+                )
 
         await emit(
             {
@@ -591,6 +810,7 @@ class AssistantGraph:
                     else "无需执行工具"
                 ),
                 "tool_count": len(executed),
+                "error_count": len(tool_errors),
             }
         )
         return {
@@ -602,7 +822,30 @@ class AssistantGraph:
             ),
             "sources": sources,
             "web_results": web_results,
+            "execution_plan": plan,
         }
+
+    @staticmethod
+    def _tool_label(name: str) -> str:
+        return {
+            "get_current_time": "当前时间工具",
+            "search_knowledge_base": "知识库检索",
+            "web_search": "联网搜索",
+            "fetch_web_page": "网页读取",
+            "calculate": "计算工具",
+            "list_knowledge_documents": "知识库文档列表",
+            "list_long_term_memories": "长期记忆读取",
+            "search_conversation_history": "历史会话检索",
+        }.get(name, f"工具 {name or 'unknown'}")
+
+    @staticmethod
+    def _format_plan(plan: list[dict[str, Any]]) -> str:
+        return "\n".join(
+            f"{index}. [{item.get('status', 'pending')}] "
+            f"{item.get('title', '')}"
+            + (f"（工具：{item['tool']}）" if item.get("tool") else "")
+            for index, item in enumerate(plan, start=1)
+        )
 
     async def _time_tool(
         self, state: AgentState, config: RunnableConfig
@@ -683,7 +926,27 @@ class AssistantGraph:
             }
         )
         search_query = query or state["question"]
-        results = await self.web_search.search_safe(search_query)
+        try:
+            results = await self.web_search.search_safe(search_query)
+        except WebSearchError as exc:
+            logger.warning(
+                "Agent web_search failed provider=%s reason=%s",
+                self.web_search.settings.web_search_provider,
+                exc,
+            )
+            await emit(
+                {
+                    "type": "status",
+                    "stage": "web_search",
+                    "message": f"{exc}，已跳过联网搜索并继续回答",
+                    "query": search_query,
+                    "error": True,
+                }
+            )
+            return {
+                "web_results": [],
+                "tool_error": f"{exc}，已跳过联网搜索并继续回答。",
+            }
         enriched_count = 0
         failed_count = 0
         if results and self.web_crawler is not None:
@@ -786,22 +1049,55 @@ class AssistantGraph:
         self, state: AgentState, config: RunnableConfig
     ) -> dict[str, Any]:
         emit = _emit_from_config(config)
+        plan = [
+            dict(item)
+            for item in state.get("execution_plan", [])
+            if isinstance(item, dict)
+        ]
+        final_index = len(plan) - 1
+        if final_index >= 0 and plan[final_index].get("status") == "pending":
+            plan[final_index]["status"] = "running"
+            await emit(
+                {
+                    "type": "plan_step",
+                    "step_id": plan[final_index].get(
+                        "id",
+                        f"step-{final_index + 1}",
+                    ),
+                    "status": "running",
+                    "message": str(plan[final_index].get("title", "")),
+                    "execution_plan": plan,
+                }
+            )
         sources = state.get("sources", [])
         web_results = state.get("web_results", [])
         context_parts = []
         for source in sources:
             context_parts.append(
-                f"[知识库来源: {source['filename']} | 片段 {source['chunk_index'] + 1}]\n"
+                f"[本轮知识库来源: {source['filename']} | "
+                f"片段 {source['chunk_index'] + 1}]\n"
                 f"{source['content']}"
             )
         for item in web_results:
             context_parts.append(
-                f"[联网来源: {item.get('title', '无标题')} | {item.get('url', '')}]\n"
+                f"[本轮联网来源: {item.get('title', '无标题')} | "
+                f"{item.get('url', '')}]\n"
                 f"{item.get('content') or item.get('snippet', '')}"
             )
         tool_context = state.get("tool_result", "")
         if state.get("tool_error"):
-            tool_context = state["tool_error"]
+            tool_context = "\n\n".join(
+                item
+                for item in [
+                    tool_context,
+                    (
+                        "工具执行异常（必须向用户说明失败环节及其影响，"
+                        "不得把失败结果当作成功事实）：\n"
+                        + state["tool_error"]
+                    ),
+                ]
+                if item
+            )
         memories = state.get("memories", [])
         deleted_memories = state.get("deleted_memories", [])
         memory_context = format_memory_context(memories, deleted_memories or None)
@@ -829,6 +1125,7 @@ class AssistantGraph:
             tool_context=tool_context,
             long_term_context=memory_context,
             conversation_context=conversation_context,
+            execution_plan=self._format_plan(plan),
         ):
             pieces.append(delta)
             await emit({"type": "delta", "content": delta})
@@ -836,6 +1133,20 @@ class AssistantGraph:
         answer = "".join(pieces).strip()
         if not answer:
             raise ModelUpstreamError("模型返回了空响应，请稍后重试")
+
+        if state.get("tool_error"):
+            failures = "；".join(
+                line.strip()
+                for line in state["tool_error"].splitlines()
+                if line.strip()
+            )
+            notice = (
+                "\n\n工具执行提示：部分步骤未成功完成。"
+                f"{failures}"
+            )
+            pieces.append(notice)
+            answer += notice
+            await emit({"type": "delta", "content": notice})
 
         if state.get("show_sources") and (sources or web_results):
             refs: list[str] = []
@@ -854,7 +1165,21 @@ class AssistantGraph:
                 await emit({"type": "delta", "content": suffix})
 
         logger.info("Agent node=answer completed answer_chars=%s", len(answer))
-        return {"answer": answer}
+        if final_index >= 0:
+            plan[final_index]["status"] = "completed"
+            await emit(
+                {
+                    "type": "plan_step",
+                    "step_id": plan[final_index].get(
+                        "id",
+                        f"step-{final_index + 1}",
+                    ),
+                    "status": "completed",
+                    "message": str(plan[final_index].get("title", "")),
+                    "execution_plan": plan,
+                }
+            )
+        return {"answer": answer, "execution_plan": plan}
 
     async def run(
         self,
