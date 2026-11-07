@@ -20,7 +20,11 @@ from app.services.voice_prompts import VoicePromptStore
 logger = logging.getLogger(__name__)
 
 MAX_TTS_CHARS = 20000
-MIN_TTS_SPOKEN_CHARS = 12
+TTS_FIRST_SEGMENT_MAX_CHARS = 120
+TTS_FOLLOWING_SEGMENT_MAX_CHARS = 90
+TTS_MIN_SEGMENT_CHARS = 24
+TTS_MIN_TRAILING_CHARS = 8
+_TTS_HARD_SEGMENT_MAX_CHARS = TTS_FIRST_SEGMENT_MAX_CHARS
 _EDGE_VOICE = "zh-CN-XiaoxiaoNeural"
 
 EDGE_CN_VOICES: dict[str, str] = {
@@ -39,6 +43,40 @@ EDGE_CN_VOICES: dict[str, str] = {
     "zh-HK-HiuMaanNeural": "曉曼（香港粤语女声）",
     "zh-HK-WanLungNeural": "雲龍（香港粤语男声）",
 }
+
+_ALPHANUMERIC_IDENTIFIER = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?=[A-Za-z0-9_.-]*[A-Za-z][A-Za-z0-9_.-]*)"
+    r"(?=[A-Za-z0-9_.-]*\d[A-Za-z0-9_.-]*)"
+    r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?"
+    r"(?![A-Za-z0-9])"
+)
+_ENGLISH_DIGITS = {
+    "0": "zero",
+    "1": "one",
+    "2": "two",
+    "3": "three",
+    "4": "four",
+    "5": "five",
+    "6": "six",
+    "7": "seven",
+    "8": "eight",
+    "9": "nine",
+}
+
+
+def _speak_alphanumeric_identifier(token: str) -> str:
+    spoken = token.replace(".", " point ")
+    spoken = spoken.replace("-", " ").replace("_", " ")
+    spoken = re.sub(
+        r"\d+",
+        lambda match: " "
+        + " ".join(_ENGLISH_DIGITS[digit] for digit in match.group())
+        + " ",
+        spoken,
+    )
+    spoken = re.sub(r"\s+", " ", spoken).strip()
+    return f" {spoken} "
 
 REQUIRED_MODEL_FILES = (
     "cosyvoice2.yaml",
@@ -108,36 +146,12 @@ def _scan_rvc_models(model_dir: Path) -> list[Path]:
 
 def _split_tts_text(
     text: str,
-    max_chars: int = 90,
-    first_max_chars: int = 32,
+    max_chars: int = TTS_FOLLOWING_SEGMENT_MAX_CHARS,
+    first_max_chars: int | None = None,
 ) -> list[str]:
-    """Split long replies into sentence-aligned chunks for progressive audio."""
-    parts = [
-        part.strip()
-        for part in re.split(r"(?<=[。！？!?；;])|(?<=\n)", text)
-        if part.strip()
-    ]
-    chunks: list[str] = []
-    current = ""
-    for part in parts:
-        remaining = part
-        while remaining:
-            limit = first_max_chars if not chunks else max_chars
-            if not current and len(remaining) <= limit:
-                current = remaining
-                remaining = ""
-            elif current and len(current) + len(remaining) <= limit:
-                current += remaining
-                remaining = ""
-            elif current:
-                chunks.append(current)
-                current = ""
-            else:
-                chunks.append(remaining[:limit].strip())
-                remaining = remaining[limit:]
-    if current:
-        chunks.append(current)
-    return chunks or [text]
+    """Compatibility wrapper for the punctuation-first streaming strategy."""
+    del first_max_chars
+    return _group_tts_paragraphs(text, max_chars=max_chars)
 
 
 def _take_tts_chunk(text: str, limit: int) -> tuple[str, str]:
@@ -147,18 +161,43 @@ def _take_tts_chunk(text: str, limit: int) -> tuple[str, str]:
     window = text[: limit + 1]
     minimum = max(12, limit // 3)
     for separators in ("。！？!?；;", "，,、：:"):
-        positions = [window.rfind(char) for char in separators]
-        cut = max(positions)
-        if cut >= minimum:
-            return text[: cut + 1].strip(), text[cut + 1 :].strip()
-    return text[:limit].strip(), text[limit:].strip()
+        positions = [
+            position
+            for char in separators
+            if (position := window.rfind(char)) >= minimum
+        ]
+        for cut in sorted(positions, reverse=True):
+            remaining = text[cut + 1 :].strip()
+            if len(remaining) >= TTS_MIN_TRAILING_CHARS:
+                return text[: cut + 1].strip(), remaining
+    cut = limit
+    if len(text) - cut < TTS_MIN_TRAILING_CHARS:
+        midpoint = len(text) // 2
+        candidates = [
+            index
+            for index, char in enumerate(text)
+            if minimum <= index < len(text) - TTS_MIN_TRAILING_CHARS
+            and char in "，,、：:"
+        ]
+        cut = (
+            min(candidates, key=lambda index: abs(index - midpoint))
+            if candidates
+            else midpoint
+        )
+    while (
+        cut > minimum
+        and text[cut - 1 : cut + 1].isascii()
+        and text[cut - 1 : cut + 1].isalnum()
+    ):
+        cut -= 1
+    return text[:cut].strip(), text[cut:].strip()
 
 
 def _split_tts_sentences(
     text: str,
-    max_sentence_chars: int = 64,
+    max_sentence_chars: int = TTS_FIRST_SEGMENT_MAX_CHARS,
 ) -> list[str]:
-    """Split by complete sentences and split long sentences into at most two."""
+    """Split by punctuation, then split overlong clauses at natural pauses."""
     boundaries = list(re.finditer(r"[。！？!?；;]+|\n+", text))
     raw_sentences: list[str] = []
     start = 0
@@ -173,114 +212,90 @@ def _split_tts_sentences(
 
     segments: list[str] = []
     for sentence in raw_sentences or [text.strip()]:
-        if len(sentence) <= max_sentence_chars:
-            segments.append(sentence)
-            continue
-        midpoint = len(sentence) // 2
-        search_start = max(8, midpoint - 20)
-        search_end = min(len(sentence) - 8, midpoint + 20)
-        candidates = [
-            index
-            for index, char in enumerate(sentence)
-            if search_start <= index < search_end and char in "，,、：:"
-        ]
-        cut = (
-            min(candidates, key=lambda index: abs(index - midpoint))
-            if candidates
-            else midpoint
-        )
-        first = sentence[: cut + 1].strip()
-        second = sentence[cut + 1 :].strip()
-        if first:
-            segments.append(first)
-        if second:
-            segments.append(second)
-    return segments or [text.strip()]
-
-
-def _group_sentence_segments(
-    segments: list[str],
-    first_maximum_chars: int = 120,
-    subsequent_start_chars: int = 80,
-    previous_chars: int | None = None,
-) -> list[str]:
-    """Build strictly decreasing blocks while preferring sentence boundaries."""
-    grouped: list[str] = []
-    pending = [segment.strip() for segment in segments if segment.strip()]
-    previous = previous_chars
-    while pending:
-        limit = (
-            first_maximum_chars
-            if previous is None
-            else min(
-                subsequent_start_chars,
-                max(MIN_TTS_SPOKEN_CHARS, previous - 1),
+        remaining = sentence.strip()
+        while len(remaining) > max_sentence_chars:
+            take, remaining = _take_tts_chunk(
+                remaining,
+                max_sentence_chars,
             )
-        )
-        content = ""
-        while pending:
-            remaining = limit - len(content)
-            if remaining <= 0:
+            if take:
+                segments.append(take)
+            if not remaining:
                 break
-            segment = pending.pop(0)
-            if len(segment) <= remaining:
-                content += segment
-                continue
-            take, left = _take_tts_chunk(segment, remaining)
-            content += take
-            if left:
-                pending.insert(0, left)
-            break
-        content = content.strip()
-        if not content:
-            segment = pending.pop(0)
-            content, left = _take_tts_chunk(segment, max(1, limit))
-            if left:
-                pending.insert(0, left)
-        grouped.append(content)
-        previous = len(content)
-    return grouped
+        if remaining:
+            segments.append(remaining)
+    return segments or [text.strip()]
 
 
 def _spoken_char_count(text: str) -> int:
     return len(re.findall(r"[\u3400-\u9fffA-Za-z0-9]", text))
 
 
-def _merge_short_tts_segments(segments: list[str]) -> list[str]:
-    """Avoid unsafe one-character CosyVoice requests by merging short pieces."""
-    merged: list[str] = []
-    pending = ""
-    for segment in segments:
-        segment = segment.strip()
-        if not segment:
-            continue
-        pending += segment
-        if _spoken_char_count(pending) >= MIN_TTS_SPOKEN_CHARS:
-            merged.append(pending)
-            pending = ""
-    if pending:
-        if merged and _spoken_char_count(pending) < MIN_TTS_SPOKEN_CHARS:
-            merged[-1] += pending
-        else:
-            merged.append(pending)
-    return merged or [""]
-
-
-def _group_tts_paragraphs(text: str) -> list[str]:
-    """Group sentences into stable, speakable blocks."""
+def _group_tts_paragraphs(
+    text: str,
+) -> list[str]:
+    """Build a larger opening chunk, then stable following chunks."""
     paragraphs = [
         paragraph.strip()
         for paragraph in re.split(r"\n\s*\n+", text)
         if paragraph.strip()
     ]
-    grouped: list[str] = []
+    sentences: list[str] = []
     for paragraph in paragraphs:
-        sentences = _split_tts_sentences(paragraph)
-        paragraph_groups = _group_sentence_segments(
-            sentences,
+        sentences.extend(
+            _split_tts_sentences(
+                paragraph,
+                max_sentence_chars=TTS_FIRST_SEGMENT_MAX_CHARS,
+            )
         )
-        grouped.extend(paragraph_groups)
-    return _merge_short_tts_segments(grouped) or [text.strip()]
+
+    grouped: list[str] = []
+    current = ""
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        target = (
+            TTS_FIRST_SEGMENT_MAX_CHARS
+            if not grouped
+            else TTS_FOLLOWING_SEGMENT_MAX_CHARS
+        )
+        if not current:
+            current = sentence
+        elif len(current) + len(sentence) <= target:
+            current += sentence
+        else:
+            grouped.append(current)
+            current = sentence
+        if len(current) > target:
+            pieces = _split_tts_sentences(
+                current,
+                max_sentence_chars=target,
+            )
+            if len(pieces) > 1:
+                grouped.extend(pieces[:-1])
+                current = pieces[-1]
+    if current:
+        grouped.append(current)
+
+    normalized: list[str] = []
+    for chunk in grouped:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if (
+            normalized
+            and (
+                _spoken_char_count(chunk) < TTS_MIN_SEGMENT_CHARS
+                or _spoken_char_count(normalized[-1]) < TTS_MIN_SEGMENT_CHARS
+            )
+            and len(normalized[-1]) + len(chunk)
+            <= _TTS_HARD_SEGMENT_MAX_CHARS
+        ):
+            normalized[-1] += chunk
+        else:
+            normalized.append(chunk)
+    return normalized or [text.strip()]
 
 
 def _normalize_spoken_text(text: str) -> str:
@@ -317,6 +332,11 @@ def _normalize_spoken_text(text: str) -> str:
     text = re.sub(r"。{2,}", "。", text)
     text = re.sub(r"，([。！？!?；;])", r"\1", text)
     text = re.sub(r"[ \t]+([，。！？!?；;])", r"\1", text)
+    text = _ALPHANUMERIC_IDENTIFIER.sub(
+        lambda match: _speak_alphanumeric_identifier(match.group()),
+        text,
+    )
+    text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
 
 
